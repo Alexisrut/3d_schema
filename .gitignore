@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# База и загруженные модели
+backend/data.db
+backend/data.db-wal
+backend/data.db-shm
+backend/storage/models/*
+!backend/storage/models/.gitkeep
+backend/.env
+
+# Node
+node_modules/
+dist/
+.vite/
+*.local
+
+# Редакторы и ОС
+.DS_Store
+.idea/
+.vscode/
