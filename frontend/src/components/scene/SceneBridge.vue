@@ -23,11 +23,14 @@ import {
 import { rayPlaneIntersection, type Vec3 } from '@/three/geometry'
 import { modeFromEvent, type SelectMode } from '@/lib/selection'
 import {
+  bindInvalidate,
+  bumpFrameTick,
   draggingBrigadeId,
   draggingVertex,
   dragHoverSectorId,
   hoveredVertexKey,
   modelRoots,
+  invalidateScene,
   onFrame,
   publishRenderer,
   retireRenderer,
@@ -80,7 +83,7 @@ const emit = defineEmits<{
  */
 let releaseActive: (() => void) | null = null
 
-const { camera, renderer } = useTresContext()
+const { camera, renderer, scene, invalidate } = useTresContext()
 
 const raycaster = new THREE.Raycaster()
 const pointer = new THREE.Vector2()
@@ -151,9 +154,37 @@ function sectorIdFromObject(object: THREE.Object3D | null): number | null {
  * текущую цель перпендикулярно взгляду: зум тогда ведёт себя как обычный,
  * но в сторону курсора, а не «прыгает» в центр сцены.
  */
-function anchorUnderCursor(activeCamera: THREE.Camera): Point3 | null {
+/**
+ * Кэш точки под курсором на время одного жеста прокрутки.
+ *
+ * Луч по модели из тысяч деталей стоит несколько миллисекунд, а тачпад шлёт
+ * десятки событий в секунду — на тяжёлой выгрузке зум ощутимо запаздывал.
+ * Пересчитывать не нужно: смысл зума к курсору в том, что точка под
+ * курсором остаётся на месте, поэтому пока курсор стоит, якорь тот же.
+ * Кэш сбрасывается при сдвиге курсора и по паузе — сцена могла измениться.
+ */
+let anchorCache: { x: number; y: number; at: number; point: Point3 } | null = null
+const ANCHOR_CACHE_MS = 400
+const ANCHOR_CACHE_PX = 4
+
+function anchorUnderCursor(activeCamera: THREE.Camera, screenX: number, screenY: number): Point3 | null {
+  const now = performance.now()
+  if (
+    anchorCache &&
+    now - anchorCache.at < ANCHOR_CACHE_MS &&
+    Math.abs(anchorCache.x - screenX) <= ANCHOR_CACHE_PX &&
+    Math.abs(anchorCache.y - screenY) <= ANCHOR_CACHE_PX
+  ) {
+    anchorCache.at = now
+    return anchorCache.point
+  }
+
   const hit = castAgainst([...modelList(), ...sectorMeshList()])
-  if (hit) return [hit.point.x, hit.point.y, hit.point.z]
+  if (hit) {
+    const point: Point3 = [hit.point.x, hit.point.y, hit.point.z]
+    anchorCache = { x: screenX, y: screenY, at: now, point }
+    return point
+  }
 
   if (!controls) return null
   // castAgainst уже выставил луч из курсора; переиспользуем его.
@@ -163,12 +194,14 @@ function anchorUnderCursor(activeCamera: THREE.Camera): Point3 | null {
   const view = new THREE.Vector3()
   activeCamera.getWorldDirection(view)
   const targetPoint = controls.target
-  return rayPlaneIntersection(
+  const fallback = rayPlaneIntersection(
     [origin.x, origin.y, origin.z],
     [direction.x, direction.y, direction.z],
     [targetPoint.x, targetPoint.y, targetPoint.z],
     [view.x, view.y, view.z],
   )
+  if (fallback) anchorCache = { x: screenX, y: screenY, at: now, point: fallback }
+  return fallback
 }
 
 function onWheel(event: WheelEvent): void {
@@ -185,7 +218,7 @@ function onWheel(event: WheelEvent): void {
 
   if (!updatePointer(event)) return
 
-  const anchor = anchorUnderCursor(activeCamera)
+  const anchor = anchorUnderCursor(activeCamera, event.clientX, event.clientY)
   if (!anchor) return
 
   const next = zoomTowardPoint({
@@ -204,6 +237,8 @@ function onWheel(event: WheelEvent): void {
   activeCamera.position.set(next.position[0], next.position[1], next.position[2])
   controls.target.set(next.target[0], next.target[1], next.target[2])
   controls.update()
+  invalidateScene()
+  bumpFrameTick()
 }
 
 // ------------------------------------------------------- перетаскивание вершин
@@ -306,7 +341,10 @@ function updateHover(event: PointerEvent): void {
   }
   if (!updatePointer(event)) return
   const hit = castAgainst(handles)
-  hoveredVertexKey.value = (hit?.object.userData?.vertexKey as string | undefined) ?? null
+  const next = (hit?.object.userData?.vertexKey as string | undefined) ?? null
+  if (next === hoveredVertexKey.value) return
+  hoveredVertexKey.value = next
+  invalidateScene()
 }
 
 // ------------------------------------------------------------------- указатель
@@ -458,7 +496,10 @@ function setupControls(): void {
   const activeRenderer = renderer.value as THREE.WebGLRenderer | undefined
   if (!activeCamera || !activeRenderer) return
 
-  publishRenderer(activeCamera, activeRenderer)
+  publishRenderer(activeCamera, activeRenderer, scene?.value ?? null)
+  // Отрисовка по требованию: функцию перерисовки отдаём в шину, чтобы её
+  // могли дёрнуть панели и компоненты вне контекста TresJS.
+  bindInvalidate(typeof invalidate === 'function' ? invalidate : null)
   published = { camera: activeCamera, renderer: activeRenderer }
 
   if (!canvasEl) attach(activeRenderer.domElement)
@@ -485,6 +526,10 @@ function setupControls(): void {
  * границу, должно обрезаться, а не исчезать вместе с половиной этажа.
  * Плоскости глобальные, поэтому режутся и зоны — сечение выглядит цельным.
  */
+function invalidateAnchorCache(): void {
+  anchorCache = null
+}
+
 function applyClipping(): void {
   const activeRenderer = renderer.value as THREE.WebGLRenderer | undefined
   if (!activeRenderer) return
@@ -500,13 +545,28 @@ function applyClipping(): void {
 
   activeRenderer.clippingPlanes = planes
   activeRenderer.localClippingEnabled = planes.length > 0
+  invalidateAnchorCache()
+  invalidateScene()
 }
 
 watch(() => [props.clipMin, props.clipMax], applyClipping)
 
-/** Обновление сглаживания камеры — один шаг общего кадрового цикла. */
+/**
+ * Один шаг кадрового цикла.
+ *
+ * `controls.update()` возвращает true, если камера сдвинулась, — при
+ * включённом сглаживании она продолжает ехать ещё несколько кадров после
+ * отпускания мыши. Перерисовываем и пересчитываем 3D-виджеты ТОЛЬКО в эти
+ * кадры: в покое сцена не трогается вовсе.
+ */
 function tick(): void {
-  controls?.update()
+  if (!controls) return
+  const moved = controls.update()
+  if (!moved) return
+  invalidateScene()
+  // Счётчик кадров двигаем тем же условием: на нём висит перепроецирование
+  // 3D-виджетов, и в покое пересчитывать их незачем.
+  bumpFrameTick()
 }
 
 watch(
@@ -533,6 +593,8 @@ watch(modelRoots, (roots) => {
   const { target } = fitCameraToObjects(activeCamera, roots)
   controls.target.copy(target)
   controls.update()
+  invalidateScene()
+  bumpFrameTick()
 })
 
 /** Освободить всё, что захватил этот экземпляр. */
@@ -563,6 +625,7 @@ onBeforeUnmount(() => {
   release()
   if (releaseActive === release) {
     releaseActive = null
+    bindInvalidate(null)
     // Камеру и рендерер с шины снимает ViewerView (resetSceneBus) при уходе
     // со страницы: объекты общие для всех экземпляров, и обнулять их здесь
     // значило бы гасить сцену, которой продолжает пользоваться живой сосед.
@@ -578,6 +641,8 @@ defineExpose({
     const { target } = fitCameraToObjects(activeCamera, modelRoots.value)
     controls.target.copy(target)
     controls.update()
+    invalidateScene()
+    bumpFrameTick()
   },
 })
 </script>

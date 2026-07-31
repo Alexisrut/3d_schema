@@ -15,7 +15,7 @@ import { onBeforeUnmount, shallowRef, watch } from 'vue'
 import * as THREE from 'three'
 
 import type { Level } from '@/api/types'
-import { modelRoots } from '@/three/sceneBus'
+import { invalidateScene, modelRoots } from '@/three/sceneBus'
 
 const props = defineProps<{
   levels: Level[]
@@ -130,6 +130,7 @@ function rebuild(): void {
   }
 
   group.value = next
+  invalidateScene()
 }
 
 watch(

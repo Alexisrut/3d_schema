@@ -1,86 +1,36 @@
 /**
- * Режим «рентгена» (п. 3.2 ТЗ): при выборе объекта вся остальная модель
- * становится полупрозрачной, а выбранный подсвечивается.
+ * Поиск деталей модели и вписывание камеры в её габариты.
+ *
+ * Режим «рентгена» (п. 3.2 ТЗ) — приглушение модели и подсветка выбранной
+ * детали — переехал в three/batching: рисуются не исходные меши, а слитая
+ * копия геометрии, и материалы теперь переключаются на ней.
  */
 import * as THREE from 'three'
 
-const ORIGINAL = '__originalMaterial'
-
-let ghostMaterial: THREE.MeshStandardMaterial | null = null
-let highlightMaterial: THREE.MeshStandardMaterial | null = null
-
-function getGhostMaterial(): THREE.MeshStandardMaterial {
-  if (!ghostMaterial) {
-    ghostMaterial = new THREE.MeshStandardMaterial({
-      color: 0x8fa3b8,
-      transparent: true,
-      opacity: 0.1,
-      depthWrite: false,
-      roughness: 1,
-      metalness: 0,
-      side: THREE.DoubleSide,
-    })
-  }
-  return ghostMaterial
-}
-
-function getHighlightMaterial(): THREE.MeshStandardMaterial {
-  if (!highlightMaterial) {
-    highlightMaterial = new THREE.MeshStandardMaterial({
-      color: 0x2f81f7,
-      emissive: 0x1b4f9c,
-      emissiveIntensity: 0.55,
-      roughness: 0.45,
-      metalness: 0.05,
-      side: THREE.DoubleSide,
-    })
-  }
-  return highlightMaterial
-}
+/**
+ * Кэш списка мешей по корню модели.
+ *
+ * Обход дерева из тысяч узлов стоит миллисекунды, а состав загруженной
+ * модели не меняется. WeakMap — чтобы выгруженный слой уходил из памяти
+ * вместе со своим списком.
+ */
+const meshCache = new WeakMap<THREE.Object3D, THREE.Mesh[]>()
 
 export function collectMeshes(root: THREE.Object3D | null): THREE.Mesh[] {
   if (!root) return []
+  const cached = meshCache.get(root)
+  if (cached) return cached
   const meshes: THREE.Mesh[] = []
   root.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) meshes.push(child as THREE.Mesh)
   })
+  meshCache.set(root, meshes)
   return meshes
 }
 
-function rememberOriginal(mesh: THREE.Mesh): void {
-  if (mesh.userData[ORIGINAL] === undefined) {
-    mesh.userData[ORIGINAL] = mesh.material
-  }
-}
-
-/**
- * @param root       корень загруженной .glb-модели
- * @param highlight  меш, который надо подсветить (или null — просто приглушить всё)
- * @param ghostAll   true — приглушать всё, включая highlight-меш
- */
-export function applyXray(
-  root: THREE.Object3D | null,
-  highlight: THREE.Mesh | null,
-  ghostAll = false,
-): void {
-  for (const mesh of collectMeshes(root)) {
-    rememberOriginal(mesh)
-    if (!ghostAll && highlight && mesh === highlight) {
-      mesh.material = getHighlightMaterial()
-    } else {
-      mesh.material = getGhostMaterial()
-    }
-  }
-}
-
-export function clearXray(root: THREE.Object3D | null): void {
-  for (const mesh of collectMeshes(root)) {
-    const original = mesh.userData[ORIGINAL]
-    if (original) {
-      mesh.material = original as THREE.Material | THREE.Material[]
-      delete mesh.userData[ORIGINAL]
-    }
-  }
+/** Забыть кэш — вызывается при выгрузке слоя. */
+export function forgetMeshes(root: THREE.Object3D | null): void {
+  if (root) meshCache.delete(root)
 }
 
 export function findMeshByName(root: THREE.Object3D | null, name: string | null): THREE.Mesh | null {

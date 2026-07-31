@@ -12,7 +12,7 @@ import * as THREE from 'three'
 import type { SectorSummary } from '@/api/types'
 import { buildPrismGeometry } from '@/three/geometry'
 import type { Visibility } from '@/lib/selection'
-import { dragHoverSectorId, registerSectorMesh } from '@/three/sceneBus'
+import { dragHoverSectorId, invalidateScene, registerSectorMesh } from '@/three/sceneBus'
 
 const props = defineProps<{
   sectors: SectorSummary[]
@@ -182,6 +182,7 @@ function rebuild(): void {
   }
   meshes.value = next
   revision.value += 1
+  invalidateScene()
 }
 
 /** Перекраска без пересборки геометрии — выделение, подсветка, прозрачность. */
@@ -204,6 +205,7 @@ function repaint(): void {
       if (lineMaterial) lineMaterial.opacity = outlineOpacityFor(sector)
     }
   }
+  invalidateScene()
 }
 
 /** Геометрию пересобираем только когда изменились форма или высота зон. */

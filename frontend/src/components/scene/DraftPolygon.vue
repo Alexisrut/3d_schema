@@ -11,6 +11,7 @@ import { onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import * as THREE from 'three'
 
 import { buildPolygonGeometry, buildPrismGeometry } from '@/three/geometry'
+import { invalidateScene } from '@/three/sceneBus'
 
 const props = defineProps<{
   points: number[][]
@@ -128,6 +129,7 @@ function rebuild(): void {
   }
 
   group.value = next
+  invalidateScene()
 }
 
 watch(() => [props.points, props.height], rebuild, { deep: true, immediate: true })

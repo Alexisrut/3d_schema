@@ -63,6 +63,8 @@ def build_nodes(
     offset_z: float = 0.0,
     with_ground: bool = True,
     prefix: str = "",
+    grid: int = 1,
+    spacing: float = 34.0,
 ) -> list[dict]:
     """Каркас: земля + этажи (перекрытие, колонны, две стены).
 
@@ -71,15 +73,17 @@ def build_nodes(
     понять, работает ли переключение видимости слоя.
     """
     nodes: list[dict] = []
+    # Смещение текущего корпуса в сетке — задаётся ниже, в цикле.
+    tile = {"dx": 0.0, "dz": 0.0, "tag": ""}
 
     def box(name: str, material: int, center, size) -> None:
         nodes.append({
-            "name": f"{prefix}{name}",
+            "name": f"{prefix}{tile['tag']}{name}",
             "mesh": material,          # меши 1:1 соответствуют материалам
             "translation": [
-                float(center[0]) + offset_x,
+                float(center[0]) + offset_x + tile["dx"],
                 float(center[1]),
-                float(center[2]) + offset_z,
+                float(center[2]) + offset_z + tile["dz"],
             ],
             "scale": [float(size[0]), float(size[1]), float(size[2])],
         })
@@ -87,7 +91,20 @@ def build_nodes(
     floor_h = 3.6
 
     if with_ground:
-        box("Ground", 3, (0, -0.25, 0), (60, 0.5, 60))
+        box("Ground", 3, (0, -0.25, 0), (60 * max(1, grid), 0.5, 60 * max(1, grid)))
+
+    span = max(1, grid)
+    for tile_x in range(span):
+        for tile_z in range(span):
+            tile["dx"] = (tile_x - (span - 1) / 2) * spacing
+            tile["dz"] = (tile_z - (span - 1) / 2) * spacing
+            tile["tag"] = "" if span == 1 else f"K{tile_x}_{tile_z}/"
+            _one_building(box, floors, width, depth, floor_h)
+    return nodes
+
+
+def _one_building(box, floors: int, width: float, depth: float, floor_h: float) -> None:
+    """Каркас одного корпуса: перекрытия, колонны, стены, кровля."""
 
     for level in range(floors):
         y_slab = level * floor_h
@@ -112,7 +129,6 @@ def build_nodes(
 
     # Кровля
     box("Roof", 1, (0, floors * floor_h, 0), (width, 0.35, depth))
-    return nodes
 
 
 def build_glb(**node_options) -> bytes:
@@ -203,6 +219,11 @@ def main() -> int:
     parser.add_argument("--offset-z", type=float, default=0.0)
     parser.add_argument("--no-ground", action="store_true", help="без плиты земли")
     parser.add_argument("--prefix", default="", help="префикс имён элементов")
+    # Сетка корпусов нужна для нагрузочной проверки: выгрузка из Revit — это
+    # десятки тысяч отдельных мешей, и на демо-домике из 19 узлов ни одна
+    # проблема с производительностью не воспроизводится.
+    parser.add_argument("--grid", type=int, default=1, help="сетка корпусов N×N")
+    parser.add_argument("--spacing", type=float, default=34.0, help="шаг сетки, м")
     args = parser.parse_args()
 
     target = Path(args.target)
@@ -215,6 +236,8 @@ def main() -> int:
         offset_z=args.offset_z,
         with_ground=not args.no_ground,
         prefix=args.prefix,
+        grid=args.grid,
+        spacing=args.spacing,
     )
     target.write_bytes(data)
     print(f"Готово: {target} ({len(data) / 1024:.1f} КБ)")

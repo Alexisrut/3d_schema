@@ -1,12 +1,13 @@
 <script setup lang="ts">
 /** Сборка 3D-сцены: канвас TresJS, свет, слои моделей, зоны и черновик. */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { TresCanvas } from '@tresjs/core'
 
 import type { Level, ProjectModel, SectorSummary } from '@/api/types'
 import type { SelectMode, Visibility } from '@/lib/selection'
 import type { VertexRing } from '@/three/sceneBus'
 import { polygonArea3D } from '@/three/geometry'
+import { invalidateScene } from '@/three/sceneBus'
 import DraftPolygon from './DraftPolygon.vue'
 import ModelLayer from './ModelLayer.vue'
 import LevelPlanes from './LevelPlanes.vue'
@@ -63,6 +64,41 @@ const emit = defineEmits<{
 
 const bridge = ref<InstanceType<typeof SceneBridge> | null>(null)
 
+/** Верхняя граница плотности пикселей: выше неё выигрыш в чёткости не стоит цены. */
+const MAX_PIXEL_RATIO = 1.5
+
+/**
+ * Любое изменение входных данных сцены — повод перерисовать кадр.
+ *
+ * Один сторож на все пропсы вместо инвалидации в каждом дочернем компоненте:
+ * так нельзя забыть источник изменений и получить «замерзшую» картинку.
+ */
+watch(
+  () => [
+    props.layers.map((l) => l.id).join(','),
+    props.sectors.length,
+    props.highlightedSectorIds.join(','),
+    JSON.stringify(props.sectorVisibility),
+    JSON.stringify(props.layerVisibility),
+    props.selectedMeshName,
+    props.ghostAll,
+    props.drawing,
+    props.draftPoints.length,
+    props.draftHeight,
+    props.editMode,
+    props.editSector?.id,
+    props.levels.length,
+    props.selectedLevelIds.join(','),
+    props.draftElevation,
+    props.clipMin,
+    props.clipMax,
+    // Геометрия зон: правка вершин меняет координаты, а не их число.
+    props.sectors.map((s) => `${s.height}:${s.coordinates.length}`).join('|'),
+  ],
+  () => invalidateScene(),
+  { deep: false },
+)
+
 /**
  * Радиус маркера вершины — от размера самой зоны.
  *
@@ -87,7 +123,22 @@ defineExpose({
 </script>
 
 <template>
-  <TresCanvas clear-color="#0d1117" :antialias="true" :alpha="false">
+  <!--
+    render-mode="on-demand" — сцена перерисовывается только когда что-то
+    изменилось. На выгрузке из Revit (тысячи мешей) один кадр стоит десятки
+    миллисекунд процессора, и непрерывная отрисовка подвешивала весь
+    интерфейс. Все императивные изменения зовут invalidateScene().
+
+    dpr ограничен сверху: на экране с плотностью 2 рендер идёт в четыре раза
+    большем числе пикселей, а на схематичной модели это не видно.
+  -->
+  <TresCanvas
+    clear-color="#0d1117"
+    render-mode="on-demand"
+    :antialias="true"
+    :alpha="false"
+    :dpr="[1, MAX_PIXEL_RATIO]"
+  >
     <TresPerspectiveCamera :position="[45, 34, 45]" :fov="50" :near="0.1" :far="5000" />
 
     <TresAmbientLight :intensity="1.9" />

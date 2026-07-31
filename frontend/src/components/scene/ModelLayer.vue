@@ -5,13 +5,20 @@
  * Слоёв на объекте несколько (архитектура, конструктив, инженерия), поэтому
  * загрузка и освобождение памяти вынесены в компонент на слой: скрытый слой
  * просто не монтируется, и его геометрия уходит из видеопамяти.
+ *
+ * Рисуется НЕ сам загруженный граф, а его «рендер-прокси» — та же геометрия,
+ * слитая в несколько крупных мешей (см. three/batching). Исходные меши
+ * остаются в сцене невидимыми: по ним по-прежнему работает луч выбора,
+ * снятие отметки этажа и «умное выделение», но они ничего не стоят при
+ * отрисовке, потому что невидимая ветка целиком пропускается рендерером.
  */
 import { onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 
-import { applyXray, clearXray, findMeshByName } from '@/three/ghosting'
-import { registerModelRoot, unregisterModelRoot } from '@/three/sceneBus'
+import { buildRenderProxy, type RenderProxy } from '@/three/batching'
+import { findMeshByName, forgetMeshes } from '@/three/ghosting'
+import { invalidateScene, registerModelRoot, unregisterModelRoot } from '@/three/sceneBus'
 
 const props = defineProps<{
   /** URL слоя с токеном (см. api/client.modelUrl). */
@@ -30,8 +37,17 @@ const emit = defineEmits<{
   (e: 'progress', percent: number): void
 }>()
 
+/**
+ * Контейнер слоя: в нём лежат невидимый корень .glb (цели для луча) и группа
+ * слитых мешей, которая и рисуется. Один <primitive> на оба, чтобы TresJS не
+ * пересоздавал их по отдельности.
+ */
 const object = shallowRef<THREE.Object3D | null>(null)
 const loading = ref(false)
+
+let proxy: RenderProxy | null = null
+/** Корень загруженной модели внутри контейнера — цели луча и габариты. */
+let modelRoot: THREE.Object3D | null = null
 
 const loader = new GLTFLoader()
 
@@ -64,8 +80,15 @@ function disposeMaterial(material: THREE.Material): void {
 function disposeCurrent(): void {
   const current = object.value
   if (!current) return
-  clearXray(current)
-  unregisterModelRoot(current)
+  // Прокси освобождаем первым: он делит материалы и часть геометрии с
+  // исходными мешами, а те освобождаются следующим шагом.
+  proxy?.dispose()
+  proxy = null
+  if (modelRoot) {
+    forgetMeshes(modelRoot)
+    unregisterModelRoot(modelRoot)
+  }
+  modelRoot = null
   current.traverse((child) => {
     const mesh = child as THREE.Mesh
     if (!mesh.isMesh) return
@@ -112,11 +135,27 @@ function load(url: string | null): void {
         }
       })
       root.name = root.name || props.label
-      object.value = root
+      freezeStaticTransforms(root)
+
+      // Слитая копия геометрии для отрисовки. Исходный граф остаётся в сцене
+      // невидимым: луч выбора работает по нему, рендерер его пропускает.
+      const container = new THREE.Group()
+      container.name = `${root.name} (слой)`
+      proxy = buildRenderProxy(root)
+      if (proxy) {
+        root.visible = false
+        container.add(root, proxy.group)
+      } else {
+        container.add(root)
+      }
+
+      modelRoot = root
+      object.value = container
       registerModelRoot(root)
       loading.value = false
       emit('loaded')
       applyAppearance()
+      invalidateScene()
     },
     (event) => {
       if (event.lengthComputable && event.total > 0) {
@@ -130,27 +169,45 @@ function load(url: string | null): void {
   )
 }
 
+/**
+ * Заморозить матрицы загруженной модели.
+ *
+ * Модель из САПР неподвижна, но three.js по умолчанию пересчитывает матрицу
+ * каждого узла в каждом кадре. На выгрузке в тысячи деталей это заметная доля
+ * кадра, потраченная впустую. Считаем матрицы один раз и отключаем
+ * автообновление; зоны, маркеры и плоскости этажей это не затрагивает —
+ * они живут отдельными объектами и продолжают двигаться.
+ */
+function freezeStaticTransforms(root: THREE.Object3D): void {
+  root.updateMatrixWorld(true)
+  root.traverse((child) => {
+    child.matrixAutoUpdate = false
+    child.updateMatrix()
+  })
+  root.updateMatrixWorld(true)
+}
+
 function applyAppearance(): void {
-  const root = object.value
-  if (!root) return
+  const root = modelRoot
+  if (!root || !proxy) return
 
   if (props.ghost) {
-    applyXray(root, null, true)
+    proxy.setGhost(true)
+    proxy.setHighlight(null)
     return
   }
-  if (props.highlightName) {
-    const mesh = findMeshByName(root, props.highlightName)
-    // Выделенный элемент лежит в другом слое — этот показываем как есть,
-    // иначе клик по элементу гасил бы все прочие модели целиком.
-    if (mesh) applyXray(root, mesh, false)
-    else clearXray(root)
-    return
-  }
-  clearXray(root)
+  const mesh = props.highlightName ? findMeshByName(root, props.highlightName) : null
+  // Выделенный элемент лежит в другом слое — этот показываем как есть,
+  // иначе клик по элементу гасил бы все прочие модели целиком.
+  proxy.setGhost(mesh !== null)
+  proxy.setHighlight(mesh)
 }
 
 watch(() => props.url, load, { immediate: true })
-watch(() => [props.highlightName, props.ghost], applyAppearance)
+watch(() => [props.highlightName, props.ghost], () => {
+  applyAppearance()
+  invalidateScene()
+})
 
 onBeforeUnmount(disposeCurrent)
 </script>

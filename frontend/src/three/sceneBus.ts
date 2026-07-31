@@ -36,6 +36,36 @@ export const vertexHandles = new Map<string, THREE.Mesh>()
 /** Счётчик кадров: HTML-виджеты пересчитывают позиции по его изменению. */
 export const frameTick = ref(0)
 
+// ------------------------------------------------- отрисовка по требованию
+/**
+ * Просьба перерисовать сцену.
+ *
+ * Сцена рисуется в режиме «по требованию»: выгрузка из Revit — это тысячи
+ * отдельных мешей, и один кадр стоит десятки миллисекунд ЧИСТОГО процессора
+ * (обход графа, пересчёт матриц, отсечение) даже когда на экране ничего не
+ * меняется. При непрерывной отрисовке этот расход шёл 60 раз в секунду и
+ * подвешивал весь интерфейс, а не только 3D.
+ *
+ * Функцию подставляет мост сцены из контекста TresJS. Пока её нет, вызовы
+ * просто копятся в счётчике — на старте это нормально.
+ */
+let invalidateFn: (() => void) | null = null
+let pendingInvalidations = 0
+
+export function bindInvalidate(fn: (() => void) | null): void {
+  invalidateFn = fn
+  if (fn && pendingInvalidations > 0) {
+    pendingInvalidations = 0
+    fn()
+  }
+}
+
+/** Перерисовать сцену на следующем кадре. Дешёвая и идемпотентная. */
+export function invalidateScene(): void {
+  if (invalidateFn) invalidateFn()
+  else pendingInvalidations += 1
+}
+
 // --------------------------------------------------------------- кадровый цикл
 /**
  * Единый requestAnimationFrame на всю сцену.
@@ -60,14 +90,23 @@ function runFrameLoop(): void {
     try {
       callback()
     } catch (error) {
-      // Один сбойный подписчик не должен останавливать счётчик кадров:
-      // на нём держатся позиции 3D-виджетов, и «замерзали» бы они все.
+      // Один сбойный подписчик не должен останавливать цикл: на нём держится
+      // сглаживание камеры, и «замерзала» бы вся сцена.
       console.error('Ошибка в кадровом обработчике сцены', error)
     }
   }
+}
+
+/**
+ * Сдвинуть счётчик кадров — сигнал 3D-виджетам пересчитать позиции.
+ *
+ * Вызывается ТОЛЬКО когда камера действительно сдвинулась. Раньше счётчик
+ * рос каждый второй кадр безусловно, и слой виджетов перерисовывался
+ * тридцать раз в секунду даже на неподвижной сцене.
+ */
+export function bumpFrameTick(): void {
   frameCounter += 1
-  // Виджеты обновляем через кадр — этого достаточно и вдвое дешевле.
-  if (frameCounter % 2 === 0) frameTick.value = frameCounter
+  frameTick.value = frameCounter
 }
 
 /** Подписаться на кадры. Возвращает функцию отписки. */
@@ -123,9 +162,15 @@ export function vertexKey(sectorId: number, index: number, ring: VertexRing = 'b
 export function publishRenderer(
   camera: THREE.PerspectiveCamera,
   renderer: THREE.WebGLRenderer,
+  scene?: THREE.Scene | null,
 ): void {
   sceneCamera.value = camera
   sceneRenderer.value = renderer
+  // Диагностика производительности только в режиме разработки: без доступа
+  // к рендереру нельзя посмотреть число вызовов отрисовки и треугольников.
+  if (import.meta.env.DEV) {
+    ;(window as unknown as Record<string, unknown>).__scene = { camera, renderer, scene }
+  }
 }
 
 export function retireRenderer(

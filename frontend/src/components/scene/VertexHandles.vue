@@ -18,6 +18,7 @@ import type { SectorSummary } from '@/api/types'
 import { defaultTopPoints } from '@/three/geometry'
 import {
   clearVertexHandles,
+  invalidateScene,
   draggingVertex,
   hoveredVertexKey,
   registerVertexHandle,
@@ -120,6 +121,7 @@ function rebuild(): void {
   addRing(topPoints.value, 'top', COLOR_TOP)
 
   group.value = next
+  invalidateScene()
 }
 
 /** Перекраска и масштаб без пересборки: наведение и захват меняются часто. */
@@ -139,6 +141,7 @@ function repaint(): void {
     material.color.setHex(isActive ? COLOR_ACTIVE : isHovered ? COLOR_HOVER : base)
     marker.scale.setScalar(props.radius * (isActive || isHovered ? 1.45 : 1))
   }
+  invalidateScene()
 }
 
 /**
@@ -158,6 +161,7 @@ function syncPositions(): void {
     const point = rings[ring]?.[index]
     if (point) child.position.set(point[0], point[1], point[2])
   }
+  invalidateScene()
 }
 
 watch(
