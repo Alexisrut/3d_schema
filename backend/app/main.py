@@ -12,7 +12,19 @@ from sqlalchemy import select
 from . import models, realtime
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .routers import auth, brigades, media, projects, sectors, users
+from .migrate import run_migrations
+from .routers import (
+    account,
+    auth,
+    brigades,
+    cards,
+    export,
+    levels,
+    media,
+    projects,
+    sectors,
+    users,
+)
 from .security import decode_access_token, hash_password
 
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +33,9 @@ log = logging.getLogger("app")
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    # create_all не меняет уже существующие таблицы — доработки схемы
+    # (brigade_ids, height, слои моделей) выполняет отдельный шаг.
+    run_migrations(engine)
     with SessionLocal() as db:
         has_admin = db.scalar(
             select(models.User).where(models.User.role == models.UserRole.admin)
@@ -65,10 +80,14 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(account.router)
 app.include_router(users.router)
 app.include_router(projects.router)
 app.include_router(brigades.router)
 app.include_router(sectors.router)
+app.include_router(cards.router)
+app.include_router(levels.router)
+app.include_router(export.router)
 # Загруженные .glb раздаются с проверкой прав, а не как открытая статика.
 app.include_router(media.router)
 

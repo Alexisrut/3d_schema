@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Path, status
+from fastapi import Depends, HTTPException, Path, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -67,6 +67,34 @@ def require_admin(user: CurrentUser) -> models.User:
 
 
 AdminUser = Annotated[models.User, Depends(require_admin)]
+
+
+# --------------------------------------------------------------- роль «Читатель»
+#: Методы, которые меняют данные. Роль reader допускается только к остальным.
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def deny_reader_writes(request: Request, user: CurrentUser) -> models.User:
+    """Запрет изменений для роли «Читатель».
+
+    Проверка навешивается на роутер целиком, а не на каждый обработчик:
+    новый маршрут получает защиту автоматически, а забыть её на одном
+    из десятка мутаций — вопрос времени. Отсюда же и опора на метод
+    запроса, а не на имя функции.
+
+    Роль читается из БД, а не из JWT: токен живёт 12 часов, и роль,
+    снятая администратором, иначе действовала бы до конца этого срока.
+    """
+    if request.method in WRITE_METHODS and user.role == models.UserRole.reader:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Роль «Читатель» не может изменять данные",
+        )
+    return user
+
+
+#: Зависимость для роутеров с мутациями. GET-маршруты она пропускает как есть.
+EditorGuard = Depends(deny_reader_writes)
 
 
 def get_project_for_user(

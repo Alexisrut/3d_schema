@@ -11,6 +11,16 @@ export const useAuthStore = defineStore('auth', () => {
 
   const isAuthenticated = computed(() => user.value !== null)
   const isAdmin = computed(() => user.value?.role === 'admin')
+  /**
+   * Может ли пользователь менять данные.
+   *
+   * Роли «Читатель» интерфейс не показывает кнопок изменения; это удобство,
+   * а не защита — запрет обеспечивает бэкенд (deps.deny_reader_writes).
+   * Пока профиль не загружен, право не выдаётся: иначе на долю секунды
+   * читателю мигали бы кнопки, которые тут же исчезают.
+   */
+  const canEdit = computed(() => user.value !== null && user.value.role !== 'reader')
+  const isReader = computed(() => user.value?.role === 'reader')
 
   async function login(username: string, password: string): Promise<boolean> {
     loading.value = true
@@ -46,5 +56,16 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
   }
 
-  return { user, loading, error, isAuthenticated, isAdmin, login, restore, logout }
+  return {
+    user,
+    loading,
+    error,
+    isAuthenticated,
+    isAdmin,
+    canEdit,
+    isReader,
+    login,
+    restore,
+    logout,
+  }
 })

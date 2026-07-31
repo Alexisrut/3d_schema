@@ -4,6 +4,13 @@ import vue from '@vitejs/plugin-vue'
 
 const BACKEND = process.env.VITE_BACKEND_URL ?? 'http://127.0.0.1:8000'
 
+/** Общий проксёр для dev-сервера и предпросмотра собранного бандла. */
+const PROXY = {
+  '/api': { target: BACKEND, changeOrigin: true },
+  '/media': { target: BACKEND, changeOrigin: true },
+  '/ws': { target: BACKEND, ws: true, changeOrigin: true },
+}
+
 export default defineConfig({
   plugins: [
     vue({
@@ -26,10 +33,12 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    proxy: {
-      '/api': { target: BACKEND, changeOrigin: true },
-      '/media': { target: BACKEND, changeOrigin: true },
-      '/ws': { target: BACKEND, ws: true, changeOrigin: true },
-    },
+    proxy: PROXY,
+  },
+  // Тот же проксёр для `vite preview`: собранный бандл надо уметь проверять
+  // локально против настоящего бэкенда, а не только dev-сервер.
+  preview: {
+    port: 4173,
+    proxy: PROXY,
   },
 })

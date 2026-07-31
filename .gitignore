@@ -11,6 +11,9 @@ backend/data.db-wal
 backend/data.db-shm
 backend/storage/models/*
 !backend/storage/models/.gitkeep
+# Вложения карточек — пользовательские файлы, в репозитории им не место.
+backend/storage/attachments/*
+!backend/storage/attachments/.gitkeep
 backend/.env
 
 # Node

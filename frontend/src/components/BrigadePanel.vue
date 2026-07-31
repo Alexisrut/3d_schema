@@ -1,22 +1,30 @@
 <script setup lang="ts">
 /**
- * Панель бригад (п. 3.4 ТЗ). Карточку можно перетащить мышью
- * на сектор в 3D-сцене или на его виджет.
+ * Панель бригад (п. 3.4 ТЗ). Карточку можно перетащить мышью на зону в
+ * 3D-сцене или на её поп-ап; на одной зоне бригад может быть несколько.
+ *
+ * Выделение бригад (Ctrl/Cmd, Shift) подсвечивает их зоны в сцене и
+ * включает массовое удаление (п. 2.3 доработок).
  */
 import { computed, ref } from 'vue'
 
 import type { BrigadeWithAssignment, SectorSummary } from '@/api/types'
+import { modeFromEvent, type SelectMode } from '@/lib/selection'
 import { draggingBrigadeId, dragHoverSectorId } from '@/three/sceneBus'
 
 const props = defineProps<{
   brigades: BrigadeWithAssignment[]
   sectors: SectorSummary[]
+  selectedIds: number[]
+  canEdit: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'create', payload: { name: string; brigadir: string; cnt_people: number }): void
-  (e: 'delete', brigadeId: number): void
-  (e: 'unassign', sectorId: number): void
+  (e: 'select', payload: { id: number; mode: SelectMode }): void
+  (e: 'delete', brigade: BrigadeWithAssignment): void
+  (e: 'delete-selected'): void
+  (e: 'unassign', payload: { sectorId: number; brigadeId: number }): void
 }>()
 
 const showForm = ref(false)
@@ -27,13 +35,19 @@ const cntPeople = ref(1)
 const free = computed(() => props.brigades.filter((b) => b.assigned_sector_ids.length === 0))
 const busy = computed(() => props.brigades.filter((b) => b.assigned_sector_ids.length > 0))
 
-function sectorNames(brigade: BrigadeWithAssignment): string {
-  return brigade.assigned_sector_ids
-    .map((id) => props.sectors.find((s) => s.id === id)?.name ?? `#${id}`)
-    .join(', ')
+function sectorName(sectorId: number): string {
+  return props.sectors.find((s) => s.id === sectorId)?.name ?? `#${sectorId}`
+}
+
+function onRowClick(event: MouseEvent, brigade: BrigadeWithAssignment): void {
+  emit('select', { id: brigade.id, mode: modeFromEvent(event) })
 }
 
 function onDragStart(event: DragEvent, brigadeId: number): void {
+  if (!props.canEdit) {
+    event.preventDefault()
+    return
+  }
   event.dataTransfer?.setData('application/x-brigade-id', String(brigadeId))
   if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
   draggingBrigadeId.value = brigadeId
@@ -63,19 +77,42 @@ function submit(): void {
   <aside class="panel">
     <header class="panel__header">
       <h2>Бригады</h2>
-      <button class="btn btn--ghost" type="button" @click="showForm = !showForm">
+      <button
+        v-if="canEdit"
+        class="btn btn--ghost"
+        type="button"
+        @click="showForm = !showForm"
+      >
         {{ showForm ? 'Отмена' : '+ Бригада' }}
       </button>
     </header>
 
-    <form v-if="showForm" class="panel__form" @submit.prevent="submit">
+    <form v-if="showForm && canEdit" class="panel__form" @submit.prevent="submit">
       <input v-model="name" placeholder="Название (Монолитчики 3)" required />
       <input v-model="brigadir" placeholder="ФИО бригадира" />
       <input v-model.number="cntPeople" type="number" min="0" placeholder="Человек" />
       <button class="btn btn--primary" type="submit">Добавить</button>
     </form>
 
-    <p class="panel__hint">Перетащите карточку на зону в 3D-сцене, чтобы назначить бригаду.</p>
+    <p class="panel__hint">
+      <template v-if="canEdit">
+        Перетащите карточку на зону в 3D-сцене, чтобы назначить бригаду.
+        Ctrl/Cmd и Shift — выбрать несколько.
+      </template>
+      <template v-else>Ctrl/Cmd и Shift — выбрать несколько бригад.</template>
+    </p>
+
+    <div v-if="selectedIds.length > 0" class="panel__bulk">
+      <span>Выбрано: {{ selectedIds.length }}</span>
+      <button
+        v-if="canEdit"
+        class="btn btn--tiny btn--danger"
+        type="button"
+        @click="emit('delete-selected')"
+      >
+        Удалить выбранные
+      </button>
+    </div>
 
     <section v-if="free.length" class="panel__group">
       <h3>Свободные</h3>
@@ -83,7 +120,9 @@ function submit(): void {
         v-for="brigade in free"
         :key="brigade.id"
         class="brigade"
-        draggable="true"
+        :class="{ 'is-selected': selectedIds.includes(brigade.id) }"
+        :draggable="canEdit"
+        @click="onRowClick($event, brigade)"
         @dragstart="onDragStart($event, brigade.id)"
         @dragend="onDragEnd"
       >
@@ -93,10 +132,11 @@ function submit(): void {
           <span>{{ brigade.cnt_people }} чел.</span>
         </div>
         <button
+          v-if="canEdit"
           class="brigade__remove"
           type="button"
           title="Удалить бригаду"
-          @click="emit('delete', brigade.id)"
+          @click.stop="emit('delete', brigade)"
         >
           ×
         </button>
@@ -109,7 +149,9 @@ function submit(): void {
         v-for="brigade in busy"
         :key="brigade.id"
         class="brigade brigade--busy"
-        draggable="true"
+        :class="{ 'is-selected': selectedIds.includes(brigade.id) }"
+        :draggable="canEdit"
+        @click="onRowClick($event, brigade)"
         @dragstart="onDragStart($event, brigade.id)"
         @dragend="onDragEnd"
       >
@@ -118,15 +160,26 @@ function submit(): void {
           <span v-if="brigade.brigadir">{{ brigade.brigadir }}</span>
           <span>{{ brigade.cnt_people }} чел.</span>
         </div>
-        <div class="brigade__sectors">→ {{ sectorNames(brigade) }}</div>
+        <div class="brigade__sectors">
+          → {{ brigade.assigned_sector_ids.map(sectorName).join(', ') }}
+        </div>
         <button
-          v-for="sectorId in brigade.assigned_sector_ids"
+          v-for="sectorId in canEdit ? brigade.assigned_sector_ids : []"
           :key="sectorId"
           class="btn btn--tiny"
           type="button"
-          @click="emit('unassign', sectorId)"
+          @click.stop="emit('unassign', { sectorId, brigadeId: brigade.id })"
         >
-          Снять с «{{ props.sectors.find((s) => s.id === sectorId)?.name ?? sectorId }}»
+          Снять с «{{ sectorName(sectorId) }}»
+        </button>
+        <button
+          v-if="canEdit"
+          class="brigade__remove"
+          type="button"
+          title="Удалить бригаду"
+          @click.stop="emit('delete', brigade)"
+        >
+          ×
         </button>
       </article>
     </section>
@@ -171,6 +224,18 @@ function submit(): void {
   line-height: 1.4;
 }
 
+.panel__bulk {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(47, 129, 247, 0.14);
+  border: 1px solid rgba(47, 129, 247, 0.4);
+  font-size: 12px;
+}
+
 .panel__group h3 {
   margin: 0 0 8px;
   font-size: 11px;
@@ -202,9 +267,16 @@ function submit(): void {
   border-color: rgba(47, 129, 247, 0.45);
 }
 
+.brigade.is-selected {
+  border-color: var(--accent);
+  background: rgba(47, 129, 247, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(47, 129, 247, 0.5);
+}
+
 .brigade__name {
   font-weight: 600;
   font-size: 13px;
+  padding-right: 20px;
 }
 
 .brigade__meta {

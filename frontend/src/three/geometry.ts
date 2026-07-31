@@ -216,6 +216,327 @@ export function buildPolygonGeometry(rawPoints: number[][], lift = 0.05): Polygo
   return { positions, indices, normal, centroid: origin }
 }
 
+/** Вертикаль мира: вдоль неё выдавливается объём зоны (шаг 2 разметки). */
+export const UP: Vec3 = [0, 1, 0]
+
+/**
+ * Объём зоны: основание, выдавленное вертикально на `height`.
+ *
+ * Возвращает замкнутую призму — низ, верх и боковые стенки, — чтобы зона
+ * охватывала настоящее 3D-пространство этажа, а не только его пол.
+ * При height <= 0 вырождается в плоский полигон: так выглядят все зоны,
+ * созданные до появления объёма, и переключение туда-обратно не требует
+ * отдельной ветки в вызывающем коде.
+ */
+export function buildPrismGeometry(
+  rawPoints: number[][],
+  height: number,
+  lift = 0.05,
+  /**
+   * Верхняя грань, если её вершины двигали вручную (п. 3.3 доработок).
+   * Должна содержать столько же точек, сколько основание, иначе боковины
+   * не сойдутся — при несовпадении молча возвращаемся к ровному выдавливанию.
+   */
+  topPoints?: number[][] | null,
+): PolygonGeometryData {
+  const flatData = buildPolygonGeometry(rawPoints, lift)
+  const custom =
+    topPoints && topPoints.length === rawPoints.length && rawPoints.length >= 3
+      ? topPoints
+      : null
+  if (!custom && (!(height > 0) || rawPoints.length < 3)) return flatData
+
+  const points = rawPoints.map(toVec3)
+  const count = rawPoints.length
+  const base = flatData.positions
+  const positions = new Float32Array(count * 6)
+
+  // Низ — уже приподнятое основание. Верх — либо заданный вручную контур,
+  // либо основание, смещённое по вертикали на высоту.
+  positions.set(base, 0)
+  for (let i = 0; i < count; i += 1) {
+    if (custom) {
+      const point = toVec3(custom[i])
+      positions[count * 3 + i * 3] = point[0]
+      positions[count * 3 + i * 3 + 1] = point[1]
+      positions[count * 3 + i * 3 + 2] = point[2]
+    } else {
+      positions[count * 3 + i * 3] = base[i * 3] + UP[0] * height
+      positions[count * 3 + i * 3 + 1] = base[i * 3 + 1] + UP[1] * height
+      positions[count * 3 + i * 3 + 2] = base[i * 3 + 2] + UP[2] * height
+    }
+  }
+
+  const indices: number[] = []
+
+  // Триангуляция основания всегда смотрит «вверх», в сторону нормали:
+  // triangulate2D приводит контур к обходу против часовой стрелки в базисе
+  // (u, v), а этот базис правый — cross(u, v) === n, — а сама нормаль
+  // приведена к неотрицательному Y в polygonNormal. Поэтому направление
+  // граней здесь не нужно измерять: оно известно заранее.
+  //
+  // Верх: та же триангуляция, сдвинутая на слой вершин, — смотрит вверх.
+  for (const index of flatData.indices) indices.push(index + count)
+  // Низ: тот же обход в обратном порядке — смотрит вниз, наружу призмы.
+  for (let i = 0; i < flatData.indices.length; i += 3) {
+    indices.push(flatData.indices[i + 2], flatData.indices[i + 1], flatData.indices[i])
+  }
+
+  // Боковины: по два треугольника на ребро. Куда смотрит стенка, задаёт
+  // направление обхода основания, а не базис проекции, — поэтому знак
+  // площади в плоскости XZ приходится учитывать отдельно. При
+  // положительном знаке порядок (i, next, next+count) даёт нормаль ВНУТРЬ
+  // призмы, и его нужно развернуть; иначе освещение стенок окажется
+  // вывернутым, а расчёт объёма по такому мешу — неверным.
+  const clockwiseFromAbove = footprintSignedArea(points) > 0
+  for (let i = 0; i < count; i += 1) {
+    const next = (i + 1) % count
+    if (clockwiseFromAbove) {
+      indices.push(i, i + count, next)
+      indices.push(i + count, next + count, next)
+    } else {
+      indices.push(i, next, next + count)
+      indices.push(i, next + count, i + count)
+    }
+  }
+
+  return {
+    positions,
+    indices,
+    normal: flatData.normal,
+    centroid: flatData.centroid,
+  }
+}
+
+/**
+ * Знаковая площадь основания в плоскости XZ.
+ *
+ * Знак — это направление обхода контура, если смотреть на объект сверху;
+ * от него зависит, куда повёрнуты боковые грани объёма.
+ */
+export function footprintSignedArea(points: Vec3[]): number {
+  if (points.length < 3) return 0
+  return signedArea(points.map((p) => [p[0], p[2]] as Vec2))
+}
+
+/**
+ * Площадь основания в горизонтальной проекции — множитель объёма.
+ *
+ * Считается именно проекция на плоскость XZ, а не площадь наклонного
+ * основания: выдавливание идёт вертикально, и объём наклонной призмы равен
+ * площади её «тени», умноженной на высоту.
+ */
+export function footprintArea(rawPoints: number[][]): number {
+  return Math.abs(footprintSignedArea(rawPoints.map(toVec3)))
+}
+
+/**
+ * Объём зоны в м³ — для карточки. При height = 0 равен нулю.
+ *
+ * С правленой верхней гранью берётся средняя высота по вершинам: точный
+ * объём наклонного тела считать незачем, а «средняя высота × след» даёт
+ * цифру, которая не спорит с тем, что видит пользователь.
+ */
+export function prismVolume(
+  rawPoints: number[][],
+  height: number,
+  topPoints?: number[][] | null,
+): number {
+  const area = footprintArea(rawPoints)
+  if (topPoints && topPoints.length === rawPoints.length && rawPoints.length >= 3) {
+    const base = rawPoints.map(toVec3)
+    const top = topPoints.map(toVec3)
+    const sum = base.reduce((acc, point, i) => acc + Math.max(0, top[i][1] - point[1]), 0)
+    return area * (sum / base.length)
+  }
+  if (!(height > 0)) return 0
+  return area * height
+}
+
+/** Верхняя грань по умолчанию: основание, поднятое на высоту. */
+export function defaultTopPoints(rawPoints: number[][], height: number): number[][] {
+  return rawPoints.map((point) => [point[0], (point[1] ?? 0) + height, point[2]])
+}
+
+// ------------------------------------------- плоские операции для выделения
+/**
+ * Точка внутри многоугольника? Проверка лучом (ray casting) в плоскости XZ.
+ *
+ * Нужна «магическому выделению»: деталь считается попавшей в область, если
+ * её след пересекается с обведённым контуром.
+ */
+export function pointInPolygon2D(point: Vec2, polygon: Vec2[]): boolean {
+  if (polygon.length < 3) return false
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const [xi, yi] = polygon[i]
+    const [xj, yj] = polygon[j]
+    // Луч вправо от точки: считаем пересечения рёбер.
+    const crosses = yi > point[1] !== yj > point[1]
+    if (!crosses) continue
+    const x = xi + ((point[1] - yi) / (yj - yi)) * (xj - xi)
+    if (point[0] < x) inside = !inside
+  }
+  return inside
+}
+
+/** Пересекаются ли отрезки AB и CD (включая касание). */
+export function segmentsIntersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2): boolean {
+  const orient = (p: Vec2, q: Vec2, r: Vec2): number => {
+    const value = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    if (Math.abs(value) < EPS) return 0
+    return value > 0 ? 1 : -1
+  }
+  const onSegment = (p: Vec2, q: Vec2, r: Vec2): boolean =>
+    Math.min(p[0], r[0]) - EPS <= q[0] &&
+    q[0] <= Math.max(p[0], r[0]) + EPS &&
+    Math.min(p[1], r[1]) - EPS <= q[1] &&
+    q[1] <= Math.max(p[1], r[1]) + EPS
+
+  const o1 = orient(a, b, c)
+  const o2 = orient(a, b, d)
+  const o3 = orient(c, d, a)
+  const o4 = orient(c, d, b)
+
+  if (o1 !== o2 && o3 !== o4) return true
+  // Вырожденные случаи: коллинеарные отрезки, касание концом.
+  if (o1 === 0 && onSegment(a, c, b)) return true
+  if (o2 === 0 && onSegment(a, d, b)) return true
+  if (o3 === 0 && onSegment(c, a, d)) return true
+  if (o4 === 0 && onSegment(c, b, d)) return true
+  return false
+}
+
+/** Прямоугольник в плоскости XZ — след детали модели. */
+export interface Rect2 {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+}
+
+export function rectCorners(rect: Rect2): Vec2[] {
+  return [
+    [rect.minX, rect.minY],
+    [rect.maxX, rect.minY],
+    [rect.maxX, rect.maxY],
+    [rect.minX, rect.maxY],
+  ]
+}
+
+/**
+ * Пересекается ли след детали с обведённым контуром.
+ *
+ * Проверяются все три случая: угол прямоугольника внутри контура, вершина
+ * контура внутри прямоугольника (контур целиком внутри детали) и пересечение
+ * рёбер. Достаточно одного — деталь захватывается ЦЕЛИКОМ, даже если попала
+ * в область краем: в этом и смысл «магического выделения».
+ */
+export function polygonIntersectsRect(polygon: Vec2[], rect: Rect2): boolean {
+  if (polygon.length < 3) return false
+  const corners = rectCorners(rect)
+
+  for (const corner of corners) {
+    if (pointInPolygon2D(corner, polygon)) return true
+  }
+  for (const vertex of polygon) {
+    if (
+      vertex[0] >= rect.minX - EPS &&
+      vertex[0] <= rect.maxX + EPS &&
+      vertex[1] >= rect.minY - EPS &&
+      vertex[1] <= rect.maxY + EPS
+    ) {
+      return true
+    }
+  }
+  for (let i = 0; i < polygon.length; i += 1) {
+    const a = polygon[i]
+    const b = polygon[(i + 1) % polygon.length]
+    for (let j = 0; j < corners.length; j += 1) {
+      const c = corners[j]
+      const d = corners[(j + 1) % corners.length]
+      if (segmentsIntersect(a, b, c, d)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Выпуклая оболочка набора точек (обход Эндрю).
+ *
+ * «Магическое выделение» строит из следов захваченных деталей один контур.
+ * Оболочка, а не общий прямоугольник: она плотнее облегает набор и не тянет
+ * зону на пустое место между разнесёнными деталями по диагонали.
+ */
+export function convexHull2D(points: Vec2[]): Vec2[] {
+  const unique = dedupePoints(points)
+  if (unique.length < 3) return unique
+
+  const sorted = [...unique].sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const cross = (o: Vec2, a: Vec2, b: Vec2): number =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+  const build = (source: Vec2[]): Vec2[] => {
+    const chain: Vec2[] = []
+    for (const point of source) {
+      while (
+        chain.length >= 2 &&
+        cross(chain[chain.length - 2], chain[chain.length - 1], point) <= EPS
+      ) {
+        chain.pop()
+      }
+      chain.push(point)
+    }
+    chain.pop() // последняя точка повторится во второй половине обхода
+    return chain
+  }
+
+  const hull = [...build(sorted), ...build([...sorted].reverse())]
+  return hull.length >= 3 ? hull : unique
+}
+
+function dedupePoints(points: Vec2[]): Vec2[] {
+  const seen = new Set<string>()
+  const result: Vec2[] = []
+  for (const point of points) {
+    if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) continue
+    // Округление до миллиметра: координаты из модели приходят с плавающим
+    // хвостом, и без него оболочка обрастает дублями-соседями.
+    const key = `${point[0].toFixed(3)}:${point[1].toFixed(3)}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(point)
+  }
+  return result
+}
+
+/**
+ * Пересечение луча с плоскостью — основа перетаскивания вершин зоны.
+ *
+ * Вершину нельзя двигать «куда попало»: она обязана остаться в плоскости
+ * своего полигона, иначе зона перестанет быть плоской и триангуляция
+ * поплывёт. Поэтому экранный луч курсора пересекается с этой плоскостью.
+ *
+ * Возвращает null, если луч плоскости параллелен или уходит от неё назад.
+ */
+export function rayPlaneIntersection(
+  origin: Vec3,
+  direction: Vec3,
+  planePoint: Vec3,
+  planeNormal: Vec3,
+): Vec3 | null {
+  const n = normalize(planeNormal)
+  const denominator = dot(n, direction)
+  if (Math.abs(denominator) < 1e-6) return null
+  const t = dot(n, subtract(planePoint, origin)) / denominator
+  if (t <= 0) return null
+  return [
+    origin[0] + direction[0] * t,
+    origin[1] + direction[1] * t,
+    origin[2] + direction[2] * t,
+  ]
+}
+
 /** Площадь многоугольника в 3D — для подписи зоны в интерфейсе. */
 export function polygonArea3D(rawPoints: number[][]): number {
   const points = rawPoints.map(toVec3)
@@ -226,9 +547,15 @@ export function polygonArea3D(rawPoints: number[][]): number {
   return Math.abs(signedArea(projectToPlane(points, origin, u, v)))
 }
 
-/** Точка, над которой висит 3D-виджет сектора. */
-export function billboardAnchor(rawPoints: number[][], offset = 1.6): Vec3 {
+/**
+ * Точка, над которой висит 3D-виджет сектора.
+ *
+ * У зоны с объёмом виджет поднимается над её верхней гранью, а не над
+ * основанием: иначе поп-ап оказывался бы внутри самой призмы.
+ */
+export function billboardAnchor(rawPoints: number[][], offset = 1.6, height = 0): Vec3 {
   const points = rawPoints.map(toVec3)
   const center = centroid(points)
-  return [center[0], center[1] + offset, center[2]]
+  const top = height > 0 ? height : 0
+  return [center[0], center[1] + top + offset, center[2]]
 }

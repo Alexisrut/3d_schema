@@ -4,6 +4,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { api } from '@/api/client'
+import { ROLE_LABEL } from '@/api/types'
 import type { Project } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 
@@ -35,9 +36,13 @@ function logout(): void {
     <header class="projects__header">
       <h1>Проекты</h1>
       <div class="projects__actions">
-        <span class="projects__user">{{ auth.user?.username }} · {{ auth.isAdmin ? 'администратор' : 'пользователь' }}</span>
-        <button v-if="auth.isAdmin" class="btn" type="button" @click="router.push({ name: 'admin' })">
-          Администрирование
+        <span class="projects__user">
+          {{ auth.user?.username }} ·
+          {{ auth.user ? ROLE_LABEL[auth.user.role] : '' }}
+        </span>
+        <!-- Раздел администрирования переехал внутрь личного кабинета. -->
+        <button class="btn" type="button" @click="router.push({ name: 'account' })">
+          Личный кабинет
         </button>
         <button class="btn btn--ghost" type="button" @click="logout">Выйти</button>
       </div>

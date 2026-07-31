@@ -8,7 +8,15 @@
  * Запуск:  node tests/check-sfc.mjs
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +24,10 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
 const srcDir = join(root, 'src')
+// Свой tsc из node_modules, если он есть: глобального в системе может не быть,
+// а молча «проходить» проверку в этом случае нельзя.
+const localTsc = join(root, 'node_modules', '.bin', 'tsc')
+const TSC = existsSync(localTsc) ? localTsc : 'tsc'
 // Каталог намеренно вне проекта: иначе tsc находит tsconfig.json выше по дереву
 // и отказывается компилировать файлы, переданные аргументами (TS5112).
 const tmpDir = join(tmpdir(), 'sfc-check')
@@ -133,7 +145,7 @@ function runTsc(files, label) {
   if (files.length === 0) return
   try {
     execFileSync(
-      'tsc',
+      TSC,
       [
         '--noEmit',
         '--skipLibCheck',

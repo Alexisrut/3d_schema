@@ -5,10 +5,12 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
 from .. import models, schemas
-from ..deps import AdminUser, DbSession
+from ..deps import AdminUser, DbSession, EditorGuard
 from ..security import hash_password
 
-router = APIRouter(prefix="/api/users", tags=["users"])
+# Маршруты и так админские (роль «Читатель» админом быть не может), но
+# защита от записи навешивается единообразно на все роутеры с мутациями.
+router = APIRouter(prefix="/api/users", tags=["users"], dependencies=[EditorGuard])
 
 
 @router.get("", response_model=list[schemas.UserOut])

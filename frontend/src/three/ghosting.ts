@@ -95,14 +95,40 @@ export function fitCameraToObject(
   object: THREE.Object3D,
   offset = 1.5,
 ): { target: THREE.Vector3; distance: number } {
-  const box = new THREE.Box3().setFromObject(object)
+  return fitCameraToObjects(camera, [object], offset)
+}
+
+/**
+ * То же для нескольких слоёв: в кадр вписывается их общая рамка.
+ *
+ * Слои .glb выгружены из одного проекта и лежат в общих координатах, но
+ * вписывать камеру по одному из них нельзя — инженерная модель может быть
+ * заметно меньше архитектурной и «сброс вида» уводил бы камеру вплотную.
+ */
+export function fitCameraToObjects(
+  camera: THREE.PerspectiveCamera,
+  objects: THREE.Object3D[],
+  offset = 1.5,
+): { target: THREE.Vector3; distance: number } {
+  const box = new THREE.Box3()
+  for (const object of objects) box.expandByObject(object)
+  if (box.isEmpty()) {
+    // Пустая сцена: оставляем камеру там, где она стоит, и смотрим в центр.
+    return { target: new THREE.Vector3(0, 0, 0), distance: camera.position.length() || 10 }
+  }
   const size = box.getSize(new THREE.Vector3())
   const center = box.getCenter(new THREE.Vector3())
 
   const maxSize = Math.max(size.x, size.y, size.z) || 10
   const fitHeightDistance = maxSize / (2 * Math.atan((Math.PI * camera.fov) / 360))
-  const fitWidthDistance = fitHeightDistance / camera.aspect
-  const distance = offset * Math.max(fitHeightDistance, fitWidthDistance)
+  // Канвас мог ещё не получить размеры — тогда aspect равен 0 или NaN, и
+  // деление на него даёт бесконечную дистанцию. Дальше в камеру уходят NaN,
+  // OrbitControls.update() падает на каждом кадре, и вместе с ним встают
+  // 3D-виджеты. Поэтому в такой момент считаем кадр квадратным.
+  const aspect = Number.isFinite(camera.aspect) && camera.aspect > 0 ? camera.aspect : 1
+  const fitWidthDistance = fitHeightDistance / aspect
+  const raw = offset * Math.max(fitHeightDistance, fitWidthDistance)
+  const distance = Number.isFinite(raw) && raw > 0 ? raw : 10
 
   const direction = new THREE.Vector3(1, 0.75, 1).normalize().multiplyScalar(distance)
   camera.position.copy(center.clone().add(direction))

@@ -24,6 +24,12 @@ const router = createRouter({
       component: () => import('@/views/ViewerView.vue'),
     },
     {
+      // Личный кабинет доступен всем ролям, включая «Читателя».
+      path: '/account',
+      name: 'account',
+      component: () => import('@/views/AccountView.vue'),
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

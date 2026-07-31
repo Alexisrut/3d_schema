@@ -10,10 +10,10 @@ from sqlalchemy import select
 
 from .. import models, schemas, services
 from ..config import settings
-from ..deps import AccessibleProject, AdminUser, CurrentUser, DbSession
+from ..deps import AccessibleProject, AdminUser, CurrentUser, DbSession, EditorGuard
 from ..realtime import notify
 
-router = APIRouter(prefix="/api/projects", tags=["projects"])
+router = APIRouter(prefix="/api/projects", tags=["projects"], dependencies=[EditorGuard])
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -68,20 +68,143 @@ def delete_project(project: AccessibleProject, db: DbSession, _: AdminUser):
     ).all()
     for sector in sectors:
         services.purge_sector_children(db, sector)
-    _remove_model_file(project.model_url)
+    # Файлы всех слоёв, а не только первого: остальные иначе остались бы
+    # на диске навсегда — записи о них уходят каскадом.
+    doomed = [m.model_url for m in _layers(db, project.id)]
+    if project.model_url:
+        doomed.append(project.model_url)
     db.delete(project)
     db.commit()
+    for url in doomed:
+        _remove_model_file(url)
 
 
-@router.post("/{project_id}/model", response_model=schemas.ProjectOut)
+# ------------------------------------------------------------- слои моделей
+@router.get("/{project_id}/models", response_model=list[schemas.ProjectModelOut])
+def list_models(project: AccessibleProject, db: DbSession) -> list[models.ProjectModel]:
+    """Слои сцены для панели «Слои»."""
+    return _layers(db, project.id)
+
+
+@router.post(
+    "/{project_id}/models",
+    response_model=schemas.ProjectModelOut,
+    status_code=status.HTTP_201_CREATED,
+)
 def upload_model(
     request: Request,
     project: AccessibleProject,
     db: DbSession,
     _: AdminUser,
     file: UploadFile = File(...),  # noqa: B008
-) -> models.Project:
-    """Загрузка .glb, выгруженного из САПР (Revit и т. п.)."""
+) -> models.ProjectModel:
+    """Добавить в сцену ещё один .glb, выгруженный из САПР (Revit и т. п.).
+
+    Каждая загрузка создаёт новый слой и не затрагивает уже загруженные:
+    на одном объекте это, как правило, разные разделы проекта (АР, КЖ, ОВ).
+    """
+    filename = _store_upload(request, project.id, file)
+
+    layer = models.ProjectModel(
+        project_id=project.id,
+        name=_display_name(file.filename),
+        model_url=f"/media/models/{filename}",
+        sort_order=_next_sort_order(db, project.id),
+    )
+    db.add(layer)
+    db.flush()
+    services.sync_primary_model(db, project)
+    db.commit()
+    db.refresh(layer)
+    notify(
+        project.id,
+        "project.models_changed",
+        {"model_id": layer.id, "model_url": layer.model_url},
+    )
+    return layer
+
+
+@router.patch("/{project_id}/models/{model_id}", response_model=schemas.ProjectModelOut)
+def update_model(
+    model_id: int,
+    payload: schemas.ProjectModelUpdate,
+    project: AccessibleProject,
+    db: DbSession,
+    _: AdminUser,
+) -> models.ProjectModel:
+    layer = _get_layer(db, project.id, model_id)
+    if payload.name is not None:
+        layer.name = payload.name
+    if payload.sort_order is not None:
+        layer.sort_order = payload.sort_order
+    db.flush()
+    services.sync_primary_model(db, project)
+    db.commit()
+    db.refresh(layer)
+    notify(project.id, "project.models_changed", {"model_id": layer.id})
+    return layer
+
+
+@router.delete("/{project_id}/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_model(
+    model_id: int, project: AccessibleProject, db: DbSession, _: AdminUser
+):
+    layer = _get_layer(db, project.id, model_id)
+    doomed = layer.model_url
+    db.delete(layer)
+    db.flush()
+    services.sync_primary_model(db, project)
+    db.commit()
+    # Файл удаляем только после успешной фиксации в БД.
+    _remove_model_file(doomed)
+    notify(project.id, "project.models_changed", {"model_id": model_id})
+
+
+@router.get("/{project_id}/snapshot", response_model=schemas.ProjectSnapshot)
+def project_snapshot(project: AccessibleProject, db: DbSession) -> schemas.ProjectSnapshot:
+    """Всё, что нужно 3D-виду: проект + бригады + секторы с готовыми сводками."""
+    return services.build_project_snapshot(db, project)
+
+
+def _layers(db, project_id: int) -> list[models.ProjectModel]:  # noqa: ANN001
+    return list(
+        db.scalars(
+            select(models.ProjectModel)
+            .where(models.ProjectModel.project_id == project_id)
+            .order_by(models.ProjectModel.sort_order, models.ProjectModel.id)
+        ).all()
+    )
+
+
+def _get_layer(db, project_id: int, model_id: int) -> models.ProjectModel:  # noqa: ANN001
+    layer = db.get(models.ProjectModel, model_id)
+    if layer is None or layer.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Слой модели не найден")
+    return layer
+
+
+def _next_sort_order(db, project_id: int) -> int:  # noqa: ANN001
+    current = db.scalar(
+        select(models.ProjectModel.sort_order)
+        .where(models.ProjectModel.project_id == project_id)
+        .order_by(models.ProjectModel.sort_order.desc())
+        .limit(1)
+    )
+    return int(current or 0) + 1
+
+
+def _display_name(filename: str | None) -> str:
+    """Имя слоя = имя файла без расширения. Показывается в панели «Слои»."""
+    stem = Path(filename or "model.glb").name
+    for suffix in (".glb", ".gltf"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem.strip()[:255] or "Модель"
+
+
+def _store_upload(request: Request, project_id: int, file: UploadFile) -> str:
+    """Проверить и сохранить .glb на диск. Возвращает имя файла в хранилище."""
     limit = settings.max_model_mb * 1024 * 1024
 
     # Отсекаем великанов по заголовку — тело запроса иначе успевает целиком
@@ -96,7 +219,7 @@ def upload_model(
         raise HTTPException(status_code=400, detail="Поддерживаются только файлы .glb / .gltf")
 
     stem = _SAFE_NAME.sub("_", Path(original).stem)[:60] or "model"
-    filename = f"p{project.id}_{uuid.uuid4().hex[:8]}_{stem}{suffix}"
+    filename = f"p{project_id}_{uuid.uuid4().hex[:8]}_{stem}{suffix}"
     target = settings.models_dir / filename
 
     written = 0
@@ -126,20 +249,7 @@ def upload_model(
             detail="Файл не похож на glTF: у .glb должна быть сигнатура 'glTF'",
         )
 
-    previous = project.model_url
-    project.model_url = f"/media/models/{filename}"
-    db.commit()
-    db.refresh(project)
-    # Старый файл удаляем только после успешной фиксации в БД.
-    _remove_model_file(previous)
-    notify(project.id, "project.model_updated", {"model_url": project.model_url})
-    return project
-
-
-@router.get("/{project_id}/snapshot", response_model=schemas.ProjectSnapshot)
-def project_snapshot(project: AccessibleProject, db: DbSession) -> schemas.ProjectSnapshot:
-    """Всё, что нужно 3D-виду: проект + бригады + секторы с готовыми сводками."""
-    return services.build_project_snapshot(db, project)
+    return filename
 
 
 def _looks_like_gltf(head: bytes, suffix: str) -> bool:

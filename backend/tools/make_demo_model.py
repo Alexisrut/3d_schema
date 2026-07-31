@@ -9,9 +9,9 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import struct
-import sys
 from pathlib import Path
 
 # --------------------------------------------------------------------- геометрия
@@ -54,23 +54,40 @@ MATERIALS = [
 ]
 
 
-def build_nodes() -> list[dict]:
-    """Каркас: земля + 4 этажа (перекрытие, колонны, две стены)."""
+def build_nodes(
+    *,
+    floors: int = 4,
+    width: float = 24.0,
+    depth: float = 16.0,
+    offset_x: float = 0.0,
+    offset_z: float = 0.0,
+    with_ground: bool = True,
+    prefix: str = "",
+) -> list[dict]:
+    """Каркас: земля + этажи (перекрытие, колонны, две стены).
+
+    Параметры нужны, чтобы собрать второй корпус для проверки слоёв: два
+    одинаковых файла в сцене накладываются друг на друга, и по ним нельзя
+    понять, работает ли переключение видимости слоя.
+    """
     nodes: list[dict] = []
 
     def box(name: str, material: int, center, size) -> None:
         nodes.append({
-            "name": name,
+            "name": f"{prefix}{name}",
             "mesh": material,          # меши 1:1 соответствуют материалам
-            "translation": [float(center[0]), float(center[1]), float(center[2])],
+            "translation": [
+                float(center[0]) + offset_x,
+                float(center[1]),
+                float(center[2]) + offset_z,
+            ],
             "scale": [float(size[0]), float(size[1]), float(size[2])],
         })
 
-    width, depth = 24.0, 16.0
     floor_h = 3.6
-    floors = 4
 
-    box("Ground", 3, (0, -0.25, 0), (60, 0.5, 60))
+    if with_ground:
+        box("Ground", 3, (0, -0.25, 0), (60, 0.5, 60))
 
     for level in range(floors):
         y_slab = level * floor_h
@@ -98,7 +115,8 @@ def build_nodes() -> list[dict]:
     return nodes
 
 
-def build_glb() -> bytes:
+def build_glb(**node_options) -> bytes:
+    """Собрать .glb. Именованные параметры уходят в build_nodes."""
     positions, normals, indices = _unit_cube()
 
     pos_bytes = struct.pack(f"<{len(positions)}f", *positions)
@@ -115,7 +133,7 @@ def build_glb() -> bytes:
 
     bin_blob = pos_bytes + nrm_bytes + idx_bytes
 
-    nodes = build_nodes()
+    nodes = build_nodes(**node_options)
 
     gltf = {
         "asset": {"version": "2.0", "generator": "3d-monitoring demo generator"},
@@ -174,9 +192,30 @@ def build_glb() -> bytes:
 
 
 def main() -> int:
-    target = Path(sys.argv[1] if len(sys.argv) > 1 else "storage/models/demo_building.glb")
+    parser = argparse.ArgumentParser(description="Генератор демонстрационной .glb")
+    parser.add_argument("target", nargs="?", default="storage/models/demo_building.glb")
+    parser.add_argument("--floors", type=int, default=4, help="число этажей")
+    parser.add_argument("--width", type=float, default=24.0)
+    parser.add_argument("--depth", type=float, default=16.0)
+    # Смещение и отказ от плиты земли нужны для второго корпуса: так два слоя
+    # в сцене стоят рядом, и видно, какой из них выключается.
+    parser.add_argument("--offset-x", type=float, default=0.0)
+    parser.add_argument("--offset-z", type=float, default=0.0)
+    parser.add_argument("--no-ground", action="store_true", help="без плиты земли")
+    parser.add_argument("--prefix", default="", help="префикс имён элементов")
+    args = parser.parse_args()
+
+    target = Path(args.target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = build_glb()
+    data = build_glb(
+        floors=args.floors,
+        width=args.width,
+        depth=args.depth,
+        offset_x=args.offset_x,
+        offset_z=args.offset_z,
+        with_ground=not args.no_ground,
+        prefix=args.prefix,
+    )
     target.write_bytes(data)
     print(f"Готово: {target} ({len(data) / 1024:.1f} КБ)")
     return 0

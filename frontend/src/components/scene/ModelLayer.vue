@@ -1,23 +1,27 @@
 <script setup lang="ts">
 /**
- * Загрузка .glb-модели объекта и режим «рентгена».
+ * Один .glb-слой сцены и его режим отображения.
  *
- * Модель выгружается из САПР (Revit) и загружается администратором;
- * здесь она только читается по URL, который отдал бэкенд.
+ * Слоёв на объекте несколько (архитектура, конструктив, инженерия), поэтому
+ * загрузка и освобождение памяти вынесены в компонент на слой: скрытый слой
+ * просто не монтируется, и его геометрия уходит из видеопамяти.
  */
 import { onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 
 import { applyXray, clearXray, findMeshByName } from '@/three/ghosting'
-import { modelRoot } from '@/three/sceneBus'
+import { registerModelRoot, unregisterModelRoot } from '@/three/sceneBus'
 
 const props = defineProps<{
+  /** URL слоя с токеном (см. api/client.modelUrl). */
   url: string | null
+  /** Человекочитаемое имя слоя — попадает в имена безымянных мешей. */
+  label: string
   /** Имя выделенного меша модели (этаж/элемент) либо null. */
   highlightName: string | null
-  /** Приглушить всю модель — когда выбран сектор, а не элемент модели. */
-  ghostAll: boolean
+  /** Приглушить весь слой: выбран сектор либо слой помечен полупрозрачным. */
+  ghost: boolean
 }>()
 
 const emit = defineEmits<{
@@ -61,6 +65,7 @@ function disposeCurrent(): void {
   const current = object.value
   if (!current) return
   clearXray(current)
+  unregisterModelRoot(current)
   current.traverse((child) => {
     const mesh = child as THREE.Mesh
     if (!mesh.isMesh) return
@@ -70,7 +75,6 @@ function disposeCurrent(): void {
     else if (material) disposeMaterial(material)
   })
   object.value = null
-  modelRoot.value = null
 }
 
 function load(url: string | null): void {
@@ -87,20 +91,32 @@ function load(url: string | null): void {
         emit('error', 'В файле нет сцены')
         return
       }
+      // Загрузка асинхронна: пока файл шёл, слой могли скрыть или заменить.
+      // Без этой проверки в сцене осел бы объект, которого никто не ждёт.
+      if (props.url !== url) {
+        root.traverse((child) => {
+          const mesh = child as THREE.Mesh
+          if (mesh.isMesh) mesh.geometry?.dispose?.()
+        })
+        loading.value = false
+        return
+      }
       // Даём безымянным мешам стабильные имена — по ним работает выделение.
+      // Имя слоя в префиксе: у двух моделей элементы иначе назывались бы
+      // одинаково, и выделение хватало бы чужой.
       let counter = 0
       root.traverse((child) => {
         if ((child as THREE.Mesh).isMesh) {
           counter += 1
-          if (!child.name) child.name = `Элемент ${counter}`
+          if (!child.name) child.name = `${props.label}: элемент ${counter}`
         }
       })
-      root.name = root.name || 'Модель'
+      root.name = root.name || props.label
       object.value = root
-      modelRoot.value = root
+      registerModelRoot(root)
       loading.value = false
       emit('loaded')
-      applySelection()
+      applyAppearance()
     },
     (event) => {
       if (event.lengthComputable && event.total > 0) {
@@ -114,23 +130,27 @@ function load(url: string | null): void {
   )
 }
 
-function applySelection(): void {
+function applyAppearance(): void {
   const root = object.value
   if (!root) return
 
-  if (props.ghostAll) {
+  if (props.ghost) {
     applyXray(root, null, true)
     return
   }
   if (props.highlightName) {
-    applyXray(root, findMeshByName(root, props.highlightName), false)
+    const mesh = findMeshByName(root, props.highlightName)
+    // Выделенный элемент лежит в другом слое — этот показываем как есть,
+    // иначе клик по элементу гасил бы все прочие модели целиком.
+    if (mesh) applyXray(root, mesh, false)
+    else clearXray(root)
     return
   }
   clearXray(root)
 }
 
 watch(() => props.url, load, { immediate: true })
-watch(() => [props.highlightName, props.ghostAll], applySelection)
+watch(() => [props.highlightName, props.ghost], applyAppearance)
 
 onBeforeUnmount(disposeCurrent)
 </script>

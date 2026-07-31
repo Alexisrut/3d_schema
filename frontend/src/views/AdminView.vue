@@ -7,7 +7,8 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { api } from '@/api/client'
-import type { Project, User, UserRole } from '@/api/types'
+import { ROLE_LABEL } from '@/api/types'
+import type { Project, ProjectModel, User, UserRole } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 
 const router = useRouter()
@@ -15,6 +16,8 @@ const auth = useAuthStore()
 
 const projects = ref<Project[]>([])
 const users = ref<User[]>([])
+/** Слои по проектам: в списке показываем их количество. */
+const modelsByProject = ref<Record<number, ProjectModel[]>>({})
 const message = ref<string | null>(null)
 const error = ref<string | null>(null)
 const uploadingFor = ref<number | null>(null)
@@ -23,7 +26,7 @@ const newProjectName = ref('')
 const newUser = ref<{ username: string; password: string; role: UserRole }>({
   username: '',
   password: '',
-  role: 'user',
+  role: 'contractor',
 })
 
 async function reload(): Promise<void> {
@@ -31,9 +34,24 @@ async function reload(): Promise<void> {
     const [p, u] = await Promise.all([api.listProjects(), api.listUsers()])
     projects.value = p
     users.value = u
+    // Проектов единицы, поэтому слои дочитываются параллельно и разом.
+    const layers = await Promise.all(
+      p.map(async (project) => {
+        try {
+          return [project.id, await api.listModels(project.id)] as const
+        } catch {
+          return [project.id, []] as const
+        }
+      }),
+    )
+    modelsByProject.value = Object.fromEntries(layers)
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Не удалось загрузить данные'
   }
+}
+
+function layerCount(projectId: number): number {
+  return modelsByProject.value[projectId]?.length ?? 0
 }
 
 onMounted(reload)
@@ -76,18 +94,37 @@ async function deleteProject(project: Project): Promise<void> {
 
 async function onModelSelected(event: Event, project: Project): Promise<void> {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file) return
+  const files = input.files
+  if (!files || files.length === 0) return
   uploadingFor.value = project.id
+  let added = 0
   try {
-    await api.uploadModel(project.id, file)
+    // Каждый файл становится отдельным слоем сцены; загружаем по одному,
+    // чтобы падение на одном файле не отменяло уже загруженные.
+    for (const file of Array.from(files)) {
+      try {
+        await api.uploadModel(project.id, file)
+        added += 1
+      } catch (e) {
+        fail(e)
+      }
+    }
     await reload()
-    notify(`Модель загружена в «${project.name}»`)
-  } catch (e) {
-    fail(e)
+    if (added > 0) notify(`В «${project.name}» добавлено слоёв: ${added}`)
   } finally {
     uploadingFor.value = null
     input.value = ''
+  }
+}
+
+async function deleteModel(project: Project, model: ProjectModel): Promise<void> {
+  if (!window.confirm(`Удалить слой «${model.name}» из «${project.name}»?`)) return
+  try {
+    await api.deleteModel(project.id, model.id)
+    await reload()
+    notify('Слой удалён')
+  } catch (e) {
+    fail(e)
   }
 }
 
@@ -101,7 +138,7 @@ async function createUser(): Promise<void> {
       role,
       allowed_project_ids: [],
     })
-    newUser.value = { username: '', password: '', role: 'user' }
+    newUser.value = { username: '', password: '', role: 'contractor' }
     await reload()
     notify('Пользователь создан')
   } catch (e) {
@@ -123,6 +160,25 @@ async function toggleAccess(user: User, projectId: number, allowed: boolean): Pr
 
 function onAccessToggle(event: Event, user: User, projectId: number): void {
   void toggleAccess(user, projectId, (event.target as HTMLInputElement).checked)
+}
+
+/** Смена роли, в том числе выдача и снятие «Читателя». */
+async function changeRole(user: User, role: UserRole): Promise<void> {
+  if (user.role === role) return
+  try {
+    const updated = await api.updateUser(user.id, { role })
+    users.value = users.value.map((u) => (u.id === updated.id ? updated : u))
+    notify(`«${user.username}» — теперь ${ROLE_LABEL[role]}`)
+  } catch (e) {
+    fail(e)
+    // Возвращаем список к состоянию сервера: <select> уже показал новое
+    // значение, а роль не изменилась.
+    await reload()
+  }
+}
+
+function onRoleChange(event: Event, user: User): void {
+  void changeRole(user, (event.target as HTMLSelectElement).value as UserRole)
 }
 
 async function deleteUser(user: User): Promise<void> {
@@ -177,12 +233,15 @@ async function resetPassword(user: User): Promise<void> {
         <button class="btn btn--primary" type="submit">Создать проект</button>
       </form>
 
+      <!-- Обёртка со своей прокруткой: на телефоне таблица шире экрана,
+           и без неё правые колонки с кнопками просто недостижимы. -->
+      <div class="table-scroll">
       <table class="table">
         <thead>
           <tr>
             <th>#</th>
             <th>Название</th>
-            <th>Модель (.glb)</th>
+            <th>Слои моделей (.glb)</th>
             <th />
           </tr>
         </thead>
@@ -191,15 +250,34 @@ async function resetPassword(user: User): Promise<void> {
             <td>{{ project.id }}</td>
             <td>{{ project.name }}</td>
             <td>
-              <span v-if="project.model_url" class="tag tag--ok">загружена</span>
+              <span v-if="layerCount(project.id) > 0" class="tag tag--ok">
+                слоёв: {{ layerCount(project.id) }}
+              </span>
               <span v-else class="tag">нет</span>
+
+              <ul v-if="layerCount(project.id) > 0" class="layers">
+                <li v-for="model in modelsByProject[project.id]" :key="model.id">
+                  <span class="layers__name">{{ model.name }}</span>
+                  <button
+                    class="layers__remove"
+                    type="button"
+                    title="Удалить слой"
+                    @click="deleteModel(project, model)"
+                  >
+                    ×
+                  </button>
+                </li>
+              </ul>
+
               <label class="upload">
+                <!-- multiple: разделы проекта (АР, КЖ, ОВ) загружаются разом -->
                 <input
                   type="file"
                   accept=".glb,.gltf"
+                  multiple
                   @change="onModelSelected($event, project)"
                 />
-                <span>{{ uploadingFor === project.id ? 'Загрузка…' : 'Загрузить .glb' }}</span>
+                <span>{{ uploadingFor === project.id ? 'Загрузка…' : '+ Добавить .glb' }}</span>
               </label>
             </td>
             <td class="table__actions">
@@ -217,6 +295,7 @@ async function resetPassword(user: User): Promise<void> {
           </tr>
         </tbody>
       </table>
+      </div>
     </section>
 
     <!-- ----------------------------------------------------- пользователи -->
@@ -227,12 +306,16 @@ async function resetPassword(user: User): Promise<void> {
         <input v-model="newUser.username" placeholder="Логин" required />
         <input v-model="newUser.password" type="password" placeholder="Пароль" required />
         <select v-model="newUser.role">
-          <option value="user">Пользователь</option>
+          <option value="contractor">Подрядчик</option>
+          <option value="reader">Читатель (только просмотр)</option>
           <option value="admin">Администратор</option>
         </select>
         <button class="btn btn--primary" type="submit">Создать</button>
       </form>
 
+      <!-- Обёртка со своей прокруткой: на телефоне таблица шире экрана,
+           и без неё правые колонки с кнопками просто недостижимы. -->
+      <div class="table-scroll">
       <table class="table">
         <thead>
           <tr>
@@ -246,9 +329,26 @@ async function resetPassword(user: User): Promise<void> {
           <tr v-for="user in users" :key="user.id">
             <td>{{ user.username }}</td>
             <td>
-              <span class="tag" :class="{ 'tag--admin': user.role === 'admin' }">
-                {{ user.role === 'admin' ? 'администратор' : 'пользователь' }}
+              <span
+                class="tag"
+                :class="{
+                  'tag--admin': user.role === 'admin',
+                  'tag--reader': user.role === 'reader',
+                }"
+              >
+                {{ ROLE_LABEL[user.role] }}
               </span>
+              <select
+                class="role-select"
+                :value="user.role"
+                :disabled="user.id === auth.user?.id"
+                title="Сменить роль"
+                @change="onRoleChange($event, user)"
+              >
+                <option value="contractor">Подрядчик</option>
+                <option value="reader">Читатель</option>
+                <option value="admin">Администратор</option>
+              </select>
             </td>
             <td>
               <span v-if="user.role === 'admin'" class="muted">все проекты</span>
@@ -279,6 +379,7 @@ async function resetPassword(user: User): Promise<void> {
           </tr>
         </tbody>
       </table>
+      </div>
     </section>
   </div>
 </template>
@@ -337,6 +438,11 @@ async function resetPassword(user: User): Promise<void> {
   margin-bottom: 14px;
 }
 
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -384,6 +490,52 @@ async function resetPassword(user: User): Promise<void> {
   color: #58a6ff;
 }
 
+.tag--reader {
+  background: rgba(255, 200, 87, 0.18);
+  color: #ffd88a;
+}
+
+.role-select {
+  margin-top: 6px;
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+.layers {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.layers li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.layers__name {
+  color: #c9d1d9;
+}
+
+.layers__remove {
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #7d8590;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.layers__remove:hover {
+  background: rgba(229, 83, 75, 0.2);
+  color: #ff9f9a;
+}
+
 .upload {
   display: inline-block;
   cursor: pointer;
@@ -411,5 +563,27 @@ async function resetPassword(user: User): Promise<void> {
 .muted {
   color: #7d8590;
   font-size: 12px;
+}
+
+/* Телефон: узкие поля и таблица со своей прокруткой вместо колонок. */
+@media (max-width: 900px) {
+  .admin {
+    padding: 16px 12px 40px;
+  }
+
+  .card {
+    padding: 14px 12px;
+  }
+
+  .row input,
+  .row select {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .table {
+    /* Минимум, ниже которого колонки слипаются в нечитаемую кашу. */
+    min-width: 520px;
+  }
 }
 </style>

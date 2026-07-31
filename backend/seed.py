@@ -15,8 +15,9 @@ from sqlalchemy import select
 from app import models
 from app.config import settings
 from app.database import Base, SessionLocal, engine
+from app.migrate import run_migrations
 from app.security import hash_password
-from app.services import recalculate_sector
+from app.services import recalculate_sector, sync_primary_model
 
 BASE_DIR = Path(__file__).resolve().parent
 DEMO_MODEL = settings.models_dir / "demo_building.glb"
@@ -36,6 +37,7 @@ def ensure_demo_model() -> str | None:
 
 def main() -> None:
     Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     model_url = ensure_demo_model()
 
     with SessionLocal() as db:
@@ -56,23 +58,53 @@ def main() -> None:
             select(models.Project).where(models.Project.name == "ЖК «Северный», корпус 3")
         )
         if project is None:
-            project = models.Project(name="ЖК «Северный», корпус 3", model_url=model_url)
+            project = models.Project(name="ЖК «Северный», корпус 3")
             db.add(project)
             db.flush()
-        elif model_url and not project.model_url:
-            project.model_url = model_url
+
+        # Демо-модель добавляется как слой; project.model_url поддерживается
+        # производным от списка слоёв.
+        if model_url:
+            has_layer = db.scalar(
+                select(models.ProjectModel).where(models.ProjectModel.model_url == model_url)
+            )
+            if has_layer is None:
+                db.add(
+                    models.ProjectModel(
+                        project_id=project.id,
+                        name="Демо-корпус",
+                        model_url=model_url,
+                        sort_order=0,
+                    )
+                )
+                db.flush()
+        sync_primary_model(db, project)
 
         prorab = db.scalar(select(models.User).where(models.User.username == "prorab"))
         if prorab is None:
             prorab = models.User(
                 username="prorab",
                 password_hash=hash_password("prorab123"),
-                role=models.UserRole.user,
+                role=models.UserRole.contractor,
                 allowed_project_ids=[project.id],
             )
             db.add(prorab)
         elif project.id not in (prorab.allowed_project_ids or []):
             prorab.allowed_project_ids = [*(prorab.allowed_project_ids or []), project.id]
+
+        # Демонстрация роли «Читатель»: только чтение, без кнопок изменения.
+        reader = db.scalar(select(models.User).where(models.User.username == "inspector"))
+        if reader is None:
+            db.add(
+                models.User(
+                    username="inspector",
+                    password_hash=hash_password("inspector123"),
+                    role=models.UserRole.reader,
+                    allowed_project_ids=[project.id],
+                )
+            )
+        elif project.id not in (reader.allowed_project_ids or []):
+            reader.allowed_project_ids = [*(reader.allowed_project_ids or []), project.id]
 
         existing_brigades = db.scalars(
             select(models.Brigade).where(models.Brigade.project_id == project.id)
@@ -104,17 +136,24 @@ def main() -> None:
         print("База заполнена.")
         print(f"  Админ:        {settings.seed_admin_username} / {settings.seed_admin_password}")
         print("  Пользователь: prorab / prorab123")
+        print("  Читатель:     inspector / inspector123")
         print(f"  Проект:       #{project.id} {project.name}")
 
 
 def _create_demo_sectors(db, project: models.Project, brigades: list[models.Brigade]) -> None:
-    """Две зоны на перекрытии 1-го этажа демо-модели (y = 0.2, чуть выше плиты)."""
+    """Две зоны на перекрытии 1-го этажа демо-модели (y = 0.2, чуть выше плиты).
+
+    У секции А задан объём (height = 3 м, высота этажа), у секции Б — нет:
+    так на демо-данных сразу видно оба варианта отображения зоны.
+    """
     y = 0.2
     definitions = [
         {
             "name": "Секция А, 1 этаж",
             "coordinates": [[-11.0, y, -7.0], [-1.0, y, -7.0], [-1.0, y, 7.0], [-11.0, y, 7.0]],
-            "brigade": brigades[0] if brigades else None,
+            "height": 3.0,
+            # На секции А работают две бригады одновременно.
+            "brigades": brigades[:2],
             "tasks": [
                 ("Устройство опалубки", "Опалубка стен и колонн секции А", "done", 100),
                 ("Армирование", "Вязка каркаса, приёмка скрытых работ", "in_progress", 60),
@@ -125,7 +164,8 @@ def _create_demo_sectors(db, project: models.Project, brigades: list[models.Brig
         {
             "name": "Секция Б, 1 этаж",
             "coordinates": [[1.0, y, -7.0], [11.0, y, -7.0], [11.0, y, 7.0], [1.0, y, 7.0]],
-            "brigade": brigades[1] if len(brigades) > 1 else None,
+            "height": 0.0,
+            "brigades": brigades[2:3],
             "tasks": [
                 ("Устройство опалубки", "Опалубка секции Б", "in_progress", 35),
                 ("Армирование", "Каркас перекрытия", "todo", 0),
@@ -139,7 +179,8 @@ def _create_demo_sectors(db, project: models.Project, brigades: list[models.Brig
             project_id=project.id,
             name=spec["name"],
             coordinates=spec["coordinates"],
-            brigade_id=spec["brigade"].id if spec["brigade"] else None,
+            height=spec["height"],
+            brigade_ids=[b.id for b in spec["brigades"]],
             task_ids=[],
             problem_ids=[],
         )

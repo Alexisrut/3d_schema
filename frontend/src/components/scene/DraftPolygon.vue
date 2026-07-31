@@ -1,15 +1,21 @@
 <script setup lang="ts">
 /**
- * Черновик зоны во время разметки: маркеры опорных точек и контур между ними.
- * Пока точек меньше трёх — рисуем только линию, заливка появляется с третьей.
+ * Черновик зоны во время разметки.
+ *
+ * Шаг 1 («polygon»): маркеры опорных точек и контур между ними; пока точек
+ * меньше трёх — только линия, заливка появляется с третьей.
+ * Шаг 2 («extrude»): та же площадь, вытянутая вверх на заданную высоту, —
+ * пользователь видит будущий объём зоны до её закрепления.
  */
 import { onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import * as THREE from 'three'
 
-import { buildPolygonGeometry } from '@/three/geometry'
+import { buildPolygonGeometry, buildPrismGeometry } from '@/three/geometry'
 
 const props = defineProps<{
   points: number[][]
+  /** Высота выдавливания; 0 — идёт первый шаг разметки. */
+  height: number
 }>()
 
 const group = shallowRef<THREE.Group | null>(null)
@@ -28,6 +34,15 @@ const fillMaterial = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
   depthWrite: false,
   depthTest: false,
+})
+/** Объём предпросмотра — заметно прозрачнее заливки, чтобы сквозь него была
+ *  видна модель и уже размеченные зоны. */
+const volumeMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffc857,
+  transparent: true,
+  opacity: 0.16,
+  side: THREE.DoubleSide,
+  depthWrite: false,
 })
 
 function disposeGroup(): void {
@@ -63,10 +78,7 @@ function rebuild(): void {
   if (props.points.length >= 2) {
     const vertices = props.points.map((p) => new THREE.Vector3(p[0], p[1], p[2]))
     if (props.points.length >= 3) vertices.push(vertices[0].clone())
-    const line = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints(vertices),
-      lineMaterial,
-    )
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(vertices), lineMaterial)
     line.renderOrder = 11
     next.add(line)
   }
@@ -82,10 +94,43 @@ function rebuild(): void {
     next.add(fill)
   }
 
+  // Предпросмотр объёма: сам корпус и рёбра, чтобы высота читалась.
+  if (props.points.length >= 3 && props.height > 0) {
+    const prism = buildPrismGeometry(props.points, props.height, 0.04)
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(prism.positions, 3))
+    geometry.setIndex(prism.indices)
+    geometry.computeVertexNormals()
+    const volume = new THREE.Mesh(geometry, volumeMaterial)
+    volume.renderOrder = 9
+    next.add(volume)
+
+    const top = props.points.map(
+      (p) => new THREE.Vector3(p[0], p[1] + props.height, p[2]),
+    )
+    top.push(top[0].clone())
+    const topLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(top), lineMaterial)
+    topLine.renderOrder = 11
+    next.add(topLine)
+
+    // Вертикальные рёбра: без них верхний контур «висит в воздухе».
+    for (const point of props.points) {
+      const edge = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(point[0], point[1], point[2]),
+          new THREE.Vector3(point[0], point[1] + props.height, point[2]),
+        ]),
+        lineMaterial,
+      )
+      edge.renderOrder = 11
+      next.add(edge)
+    }
+  }
+
   group.value = next
 }
 
-watch(() => props.points, rebuild, { deep: true, immediate: true })
+watch(() => [props.points, props.height], rebuild, { deep: true, immediate: true })
 
 onBeforeUnmount(() => {
   disposeGroup()
@@ -94,6 +139,7 @@ onBeforeUnmount(() => {
   firstMarkerMaterial.dispose()
   lineMaterial.dispose()
   fillMaterial.dispose()
+  volumeMaterial.dispose()
 })
 </script>
 

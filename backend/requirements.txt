@@ -4,5 +4,9 @@ sqlalchemy==2.0.36
 pydantic==2.10.4
 pydantic-settings==2.7.0
 python-multipart==0.0.20
+# Выгрузка задач и проблем в .xlsx
+openpyxl==3.1.5
+# Проверка адреса почты в схемах (pydantic EmailStr)
+email-validator==2.3.0
 pyjwt==2.10.1
 bcrypt==4.2.1

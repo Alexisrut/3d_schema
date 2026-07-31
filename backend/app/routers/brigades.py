@@ -5,18 +5,18 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
 from .. import models, schemas, services
-from ..deps import AccessibleProject, DbSession
+from ..deps import AccessibleProject, DbSession, EditorGuard
 from ..realtime import notify
 
-router = APIRouter(prefix="/api/projects/{project_id}/brigades", tags=["brigades"])
+router = APIRouter(
+    prefix="/api/projects/{project_id}/brigades",
+    tags=["brigades"],
+    dependencies=[EditorGuard],
+)
 
 
 def _with_assignment(db, brigade: models.Brigade) -> schemas.BrigadeWithAssignment:  # noqa: ANN001
-    sector_ids = list(
-        db.scalars(
-            select(models.Sector.id).where(models.Sector.brigade_id == brigade.id)
-        ).all()
-    )
+    sector_ids = services.sector_ids_for_brigade(db, brigade.project_id, brigade.id)
     return schemas.BrigadeWithAssignment(
         id=brigade.id,
         project_id=brigade.project_id,
@@ -34,7 +34,24 @@ def list_brigades(project: AccessibleProject, db: DbSession):
         .where(models.Brigade.project_id == project.id)
         .order_by(models.Brigade.id)
     ).all()
-    return [_with_assignment(db, b) for b in brigades]
+    # Зоны читаются один раз на весь список: _with_assignment на каждую
+    # бригаду перечитывал бы их заново (N+1 на панель бригад).
+    sectors_by_brigade: dict[int, list[int]] = {}
+    for sector in services.sectors_of_project(db, project.id):
+        for brigade_id in services.normalize_ids(sector.brigade_ids):
+            sectors_by_brigade.setdefault(brigade_id, []).append(sector.id)
+
+    return [
+        schemas.BrigadeWithAssignment(
+            id=b.id,
+            project_id=b.project_id,
+            name=b.name,
+            brigadir=b.brigadir,
+            cnt_people=b.cnt_people,
+            assigned_sector_ids=sectors_by_brigade.get(b.id, []),
+        )
+        for b in brigades
+    ]
 
 
 @router.post("", response_model=schemas.BrigadeWithAssignment, status_code=status.HTTP_201_CREATED)
@@ -52,6 +69,30 @@ def create_brigade(
     db.refresh(brigade)
     notify(project.id, "brigade.created", {"brigade_id": brigade.id})
     return _with_assignment(db, brigade)
+
+
+@router.post("/bulk/delete", response_model=schemas.BulkDeleteResult)
+def bulk_delete_brigades(
+    payload: schemas.BulkBrigadeDelete, project: AccessibleProject, db: DbSession
+):
+    """Массовое удаление бригад — одно подтверждение на весь набор.
+
+    Объявлено до маршрутов с /{brigade_id}: путь «bulk» не пройдёт проверку
+    типа int, а FastAPI на ней возвращает 422, не пробуя следующий маршрут.
+    """
+    brigade_ids = services.normalize_ids(payload.brigade_ids)
+    brigades = [_get_brigade(db, project.id, i) for i in brigade_ids]
+
+    affected: set[int] = set()
+    for brigade in brigades:
+        affected.update(services.detach_brigade_everywhere(db, project.id, brigade.id))
+        db.delete(brigade)
+    db.commit()
+
+    for brigade_id in brigade_ids:
+        notify(project.id, "brigade.deleted", {"brigade_id": brigade_id})
+    _notify_sectors(db, project.id, sorted(affected))
+    return schemas.BulkDeleteResult(deleted_ids=brigade_ids)
 
 
 @router.patch("/{brigade_id}", response_model=schemas.BrigadeWithAssignment)
@@ -76,13 +117,9 @@ def update_brigade(
 @router.delete("/{brigade_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_brigade(brigade_id: int, project: AccessibleProject, db: DbSession):
     brigade = _get_brigade(db, project.id, brigade_id)
-    # Снимаем бригаду со всех секторов, чтобы не остались висячие ссылки.
-    sectors = db.scalars(
-        select(models.Sector).where(models.Sector.brigade_id == brigade.id)
-    ).all()
-    affected = [s.id for s in sectors]
-    for sector in sectors:
-        sector.brigade_id = None
+    # Снимаем бригаду со всех секторов, чтобы не остались висячие ID:
+    # связь живёт в JSON-массиве, каскада БД у неё нет.
+    affected = services.detach_brigade_everywhere(db, project.id, brigade.id)
     db.delete(brigade)
     db.commit()
     notify(project.id, "brigade.deleted", {"brigade_id": brigade_id})
@@ -97,9 +134,11 @@ def _get_brigade(db, project_id: int, brigade_id: int) -> models.Brigade:  # noq
 
 
 def _sector_ids_of(db, brigade_id: int) -> list[int]:  # noqa: ANN001
-    return list(
-        db.scalars(select(models.Sector.id).where(models.Sector.brigade_id == brigade_id)).all()
-    )
+    """Зоны бригады — для рассылки после переименования."""
+    brigade = db.get(models.Brigade, brigade_id)
+    if brigade is None:
+        return []
+    return services.sector_ids_for_brigade(db, brigade.project_id, brigade_id)
 
 
 def _notify_sectors(db, project_id: int, sector_ids: list[int]) -> None:  # noqa: ANN001
