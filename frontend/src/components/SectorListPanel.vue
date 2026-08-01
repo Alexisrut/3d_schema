@@ -5,11 +5,16 @@
  * В сцене зону не всегда удобно поймать курсором: она может быть скрыта
  * фасадом или отнесена за пределы кадра. Список даёт те же Ctrl/Cmd и Shift,
  * что и клик по модели, и из него же работает массовое удаление.
+ *
+ * Строка списка — ещё и цель для перетаскивания бригады. В сцене попасть
+ * курсором в нужную зону тем труднее, чем плотнее застройка; в списке зона
+ * всегда на виду и названа, поэтому назначение бригады работает и здесь.
  */
 import { computed } from 'vue'
 
 import type { SectorSummary } from '@/api/types'
 import { modeFromEvent, nextVisibility, type SelectMode, type Visibility } from '@/lib/selection'
+import { draggingBrigadeId, dragHoverSectorId } from '@/three/sceneBus'
 
 const props = defineProps<{
   sectors: SectorSummary[]
@@ -25,6 +30,7 @@ const emit = defineEmits<{
   (e: 'select-all'): void
   (e: 'clear'): void
   (e: 'delete-selected'): void
+  (e: 'drop-brigade', payload: { sectorId: number; brigadeId: number }): void
 }>()
 
 const VISIBILITY_ICON: Record<Visibility, string> = {
@@ -46,6 +52,33 @@ function statusColor(sector: SectorSummary): string {
   if (sector.progress_percent >= 100) return '#3fb950'
   if (sector.progress_percent > 0) return '#2f81f7'
   return '#8b9bb4'
+}
+
+// ------------------------------------------- приём перетаскиваемой бригады
+/**
+ * Подсветка строки-приёмника идёт через ту же шину, что и в 3D-сцене:
+ * пользователь тащит одну карточку, и подсвечиваться должна одна цель,
+ * где бы он сейчас ни находился — над сценой, над поп-апом или над списком.
+ */
+function onDragOver(event: DragEvent, sectorId: number): void {
+  if (!props.canEdit || draggingBrigadeId.value === null) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+  dragHoverSectorId.value = sectorId
+}
+
+function onDragLeave(sectorId: number): void {
+  if (dragHoverSectorId.value === sectorId) dragHoverSectorId.value = null
+}
+
+function onDrop(event: DragEvent, sectorId: number): void {
+  if (!props.canEdit) return
+  event.preventDefault()
+  const raw = event.dataTransfer?.getData('application/x-brigade-id') ?? ''
+  const brigadeId = Number.parseInt(raw, 10)
+  dragHoverSectorId.value = null
+  draggingBrigadeId.value = null
+  if (Number.isFinite(brigadeId)) emit('drop-brigade', { sectorId, brigadeId })
 }
 </script>
 
@@ -86,8 +119,12 @@ function statusColor(sector: SectorSummary): string {
         :class="{
           'is-selected': selectedIds.includes(sector.id),
           'is-dim': stateOf(sector.id) !== 'normal',
+          'is-drop-target': dragHoverSectorId === sector.id && draggingBrigadeId !== null,
         }"
         @click="emit('select', { sectorId: sector.id, mode: modeFromEvent($event) })"
+        @dragover="onDragOver($event, sector.id)"
+        @dragleave="onDragLeave(sector.id)"
+        @drop="onDrop($event, sector.id)"
       >
         <span class="row__dot" :style="{ background: statusColor(sector) }" />
         <span class="row__name" :title="sector.name">{{ sector.name }}</span>
@@ -183,6 +220,12 @@ function statusColor(sector: SectorSummary): string {
 
 .row.is-dim .row__name {
   color: #6e7681;
+}
+
+/* Цель перетаскивания — тем же зелёным, что и зона под курсором в сцене. */
+.row.is-drop-target {
+  border-color: #3fb950;
+  background: rgba(63, 185, 80, 0.18);
 }
 
 .row__dot {

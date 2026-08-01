@@ -23,6 +23,8 @@ const emit = defineEmits<{
   (e: 'create', payload: { name: string; brigadir: string; cnt_people: number }): void
   (e: 'select', payload: { id: number; mode: SelectMode }): void
   (e: 'delete', brigade: BrigadeWithAssignment): void
+  (e: 'select-all'): void
+  (e: 'clear'): void
   (e: 'delete-selected'): void
   (e: 'unassign', payload: { sectorId: number; brigadeId: number }): void
 }>()
@@ -34,6 +36,10 @@ const cntPeople = ref(1)
 
 const free = computed(() => props.brigades.filter((b) => b.assigned_sector_ids.length === 0))
 const busy = computed(() => props.brigades.filter((b) => b.assigned_sector_ids.length > 0))
+
+const allSelected = computed(
+  () => props.brigades.length > 0 && props.selectedIds.length === props.brigades.length,
+)
 
 function sectorName(sectorId: number): string {
   return props.sectors.find((s) => s.id === sectorId)?.name ?? `#${sectorId}`
@@ -96,22 +102,35 @@ function submit(): void {
 
     <p class="panel__hint">
       <template v-if="canEdit">
-        Перетащите карточку на зону в 3D-сцене, чтобы назначить бригаду.
+        Перетащите карточку на зону — в 3D-сцене или в списке зон.
         Ctrl/Cmd и Shift — выбрать несколько.
       </template>
       <template v-else>Ctrl/Cmd и Shift — выбрать несколько бригад.</template>
     </p>
 
-    <div v-if="selectedIds.length > 0" class="panel__bulk">
-      <span>Выбрано: {{ selectedIds.length }}</span>
+    <!-- Тот же набор кнопок, что и в списке зон: одинаковые списки — одинаковые действия. -->
+    <div class="panel__toolbar">
+      <button
+        class="btn btn--tiny"
+        type="button"
+        :disabled="!brigades.length"
+        @click="allSelected ? emit('clear') : emit('select-all')"
+      >
+        {{ allSelected ? 'Снять выбор' : 'Выбрать все' }}
+      </button>
       <button
         v-if="canEdit"
         class="btn btn--tiny btn--danger"
         type="button"
+        :disabled="!selectedIds.length"
         @click="emit('delete-selected')"
       >
         Удалить выбранные
       </button>
+    </div>
+
+    <div v-if="selectedIds.length > 0" class="panel__bulk">
+      <span>Выбрано: {{ selectedIds.length }}</span>
     </div>
 
     <section v-if="free.length" class="panel__group">
@@ -222,6 +241,12 @@ function submit(): void {
   font-size: 11px;
   color: #7d8590;
   line-height: 1.4;
+}
+
+.panel__toolbar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .panel__bulk {

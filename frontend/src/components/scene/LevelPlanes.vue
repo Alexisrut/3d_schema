@@ -3,10 +3,14 @@
  * Плоскости этажей в сцене (п. 3.1 доработок).
  *
  * Рисуются две вещи:
- *  • «черновая» отметка — снятая с только что выбранной детали модели; по ней
+ *  • «черновая» отметка — снятая с детали в режиме «Выделение этажей»; по ней
  *    видно, где ляжет будущий этаж, ещё до его закрепления;
- *  • закреплённые уровни — тонкие плоскости с рамкой; выбранные для фильтра
- *    подсвечиваются.
+ *  • ВЫБРАННЫЕ в панели уровни — тонкие плоскости с рамкой.
+ *
+ * Незакреплённые за выбором уровни не рисуются сознательно: на объекте их
+ * десятки, и постоянная сетка полупрозрачных плит закрывала бы саму модель,
+ * ради которой всё и затевалось. Плоскость — это подсветка выбора, а не
+ * постоянный элемент сцены.
  *
  * Размер плоскости берётся от габаритов модели: фиксированный размер на
  * объекте в сотню метров выглядел бы ковриком под зданием.
@@ -26,7 +30,6 @@ const props = defineProps<{
 
 const group = shallowRef<THREE.Group | null>(null)
 
-const COLOR_LEVEL = 0x58a6ff
 const COLOR_SELECTED = 0x3fb950
 const COLOR_DRAFT = 0xffc857
 
@@ -107,22 +110,20 @@ function dispose(): void {
 function rebuild(): void {
   dispose()
   const hasDraft = props.draftElevation !== null
-  if (props.levels.length === 0 && !hasDraft) return
+  const shown = props.levels.filter((level) => props.selectedIds.includes(level.id))
+  if (shown.length === 0 && !hasDraft) {
+    // Перерисовать надо и здесь: сцена рисуется по требованию, и без этого
+    // снятые плоскости остались бы на экране до следующего движения камеры.
+    invalidateScene()
+    return
+  }
 
   const extent = modelExtent()
   const next = new THREE.Group()
   next.name = 'level-planes'
 
-  for (const level of props.levels) {
-    const selected = props.selectedIds.includes(level.id)
-    next.add(
-      makePlane(
-        level.elevation,
-        selected ? COLOR_SELECTED : COLOR_LEVEL,
-        selected ? 0.14 : 0.05,
-        extent,
-      ),
-    )
+  for (const level of shown) {
+    next.add(makePlane(level.elevation, COLOR_SELECTED, 0.14, extent))
   }
 
   if (hasDraft) {
@@ -135,7 +136,12 @@ function rebuild(): void {
 
 watch(
   () => [
-    props.levels.map((l) => `${l.id}:${l.elevation}`).join('|'),
+    // Отметки нужны только у выбранных: перерисовывать плоскости из-за
+    // переименования соседнего уровня незачем.
+    props.levels
+      .filter((l) => props.selectedIds.includes(l.id))
+      .map((l) => `${l.id}:${l.elevation}`)
+      .join('|'),
     props.selectedIds.join(','),
     props.draftElevation,
     modelRoots.value.length,

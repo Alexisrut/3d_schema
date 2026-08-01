@@ -43,8 +43,12 @@ export interface RenderProxy {
   readonly batchCount: number
   /** Приглушить всю модель либо вернуть исходные материалы. */
   setGhost(ghost: boolean): void
-  /** Подсветить одну деталь поверх приглушённой модели (null — снять). */
-  setHighlight(source: THREE.Mesh | null): void
+  /**
+   * Подсветить детали поверх приглушённой модели (null или пустой список —
+   * снять). Деталей может быть несколько: их набирают в режиме «Выделение
+   * по деталям».
+   */
+  setHighlight(sources: THREE.Mesh | readonly THREE.Mesh[] | null): void
   dispose(): void
 }
 
@@ -289,7 +293,7 @@ export function buildRenderProxy(root: THREE.Object3D): RenderProxy | null {
   }
 
   const drawn = [...batches, ...clones]
-  let highlight: THREE.Mesh | null = null
+  let highlights: THREE.Mesh[] = []
 
   const setGhost = (ghost: boolean): void => {
     for (const mesh of drawn) {
@@ -299,21 +303,24 @@ export function buildRenderProxy(root: THREE.Object3D): RenderProxy | null {
     }
   }
 
-  const setHighlight = (source: THREE.Mesh | null): void => {
-    if (highlight) {
-      group.remove(highlight)
-      highlight = null
+  const setHighlight = (sources: THREE.Mesh | readonly THREE.Mesh[] | null): void => {
+    for (const mesh of highlights) group.remove(mesh)
+    highlights = []
+    if (!sources) return
+
+    const list = Array.isArray(sources) ? sources : [sources as THREE.Mesh]
+    for (const source of list) {
+      if (!source?.geometry) continue
+      // Геометрия общая с оригиналом: подсветка не копирует данные, а лишь
+      // рисует ту же деталь другим материалом на её месте.
+      const mesh = new THREE.Mesh(source.geometry, getHighlightMaterial())
+      mesh.name = 'highlight'
+      mesh.matrixAutoUpdate = false
+      mesh.matrix.multiplyMatrices(toLocal, source.matrixWorld)
+      mesh.renderOrder = 3
+      group.add(mesh)
+      highlights.push(mesh)
     }
-    if (!source || !source.geometry) return
-    // Геометрия общая с оригиналом: подсветка не копирует данные, а лишь
-    // рисует ту же деталь другим материалом на её месте.
-    const mesh = new THREE.Mesh(source.geometry, getHighlightMaterial())
-    mesh.name = 'highlight'
-    mesh.matrixAutoUpdate = false
-    mesh.matrix.multiplyMatrices(toLocal, source.matrixWorld)
-    mesh.renderOrder = 3
-    group.add(mesh)
-    highlight = mesh
   }
 
   const dispose = (): void => {

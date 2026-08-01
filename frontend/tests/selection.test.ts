@@ -53,6 +53,38 @@ test('обычный клик оставляет одну строку', () => {
   assert.equal(state.anchor, 40)
 })
 
+test('повторный обычный клик по единственной выбранной строке снимает выбор', () => {
+  const selected = applySelection(EMPTY_SELECTION, 30, 'replace', ORDER)
+  assert.deepEqual(selected.ids, [30])
+  const cleared = applySelection(selected, 30, 'replace', ORDER)
+  assert.deepEqual(cleared.ids, [])
+  assert.equal(cleared.anchor, null, 'опора обязана обнулиться вместе с выбором')
+})
+
+test('клик по одной из нескольких выбранных строк сводит выбор к ней, а не снимает', () => {
+  // Иначе набранное Ctrl-ом выделение обнулялось бы случайным кликом внутри
+  // него, и вернуть его можно было бы только заново.
+  const state = applySelection({ ids: [10, 20, 30], anchor: 10 }, 20, 'replace', ORDER)
+  assert.deepEqual(state.ids, [20])
+})
+
+test('третий клик снова выбирает строку — состояние переключается по кругу', () => {
+  let state = applySelection(EMPTY_SELECTION, 40, 'replace', ORDER)
+  state = applySelection(state, 40, 'replace', ORDER)
+  state = applySelection(state, 40, 'replace', ORDER)
+  assert.deepEqual(state.ids, [40])
+  assert.equal(state.anchor, 40)
+})
+
+test('снятие выбора не мешает Shift начать заново', () => {
+  let state = applySelection(EMPTY_SELECTION, 20, 'replace', ORDER)
+  state = applySelection(state, 20, 'replace', ORDER)
+  // Опоры больше нет: Shift обязан вести себя как обычный клик, а не
+  // выделять случайный кусок списка от исчезнувшей опоры.
+  state = applySelection(state, 40, 'range', ORDER)
+  assert.deepEqual(state.ids, [40])
+})
+
 test('Ctrl добавляет строку к выделению', () => {
   let state = applySelection(EMPTY_SELECTION, 20, 'toggle', ORDER)
   state = applySelection(state, 40, 'toggle', ORDER)

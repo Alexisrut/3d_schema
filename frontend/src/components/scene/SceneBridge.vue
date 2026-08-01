@@ -21,6 +21,7 @@ import {
   type Point3,
 } from '@/three/controls'
 import { rayPlaneIntersection, type Vec3 } from '@/three/geometry'
+import { pickWithinClip } from '@/three/clipping'
 import { modeFromEvent, type SelectMode } from '@/lib/selection'
 import {
   bindInvalidate,
@@ -44,6 +45,10 @@ const props = defineProps<{
   drawing: boolean
   /** Режим правки границ: клик по маркеру начинает перетаскивание. */
   editMode: boolean
+  /** Шаг режима «Выделение по деталям»: на 'pick' клик набирает детали. */
+  detailStage?: 'idle' | 'pick' | 'extrude'
+  /** Режим «Выделение этажей»: только в нём клик снимает отметку с детали. */
+  levelPick?: boolean
   /** Нижняя граница показа по оси Y; null — без ограничения. */
   clipMin?: number | null
   /** Верхняя граница показа по оси Y; null — без ограничения. */
@@ -54,6 +59,8 @@ const emit = defineEmits<{
   (e: 'point', point: [number, number, number]): void
   (e: 'select-sector', payload: { sectorId: number; mode: SelectMode }): void
   (e: 'select-mesh', name: string): void
+  /** Клик по детали в режиме «Выделение по деталям»: добавить либо убрать. */
+  (e: 'pick-detail', name: string): void
   /** Отметка выбранной детали по оси Y — предложение для нового этажа. */
   (e: 'pick-elevation', elevation: number): void
   (e: 'clear-selection'): void
@@ -120,7 +127,90 @@ function castAgainst(objects: THREE.Object3D[]): THREE.Intersection | null {
   if (!activeCamera || objects.length === 0) return null
   raycaster.setFromCamera(pointer, activeCamera as THREE.Camera)
   const hits = raycaster.intersectObjects(objects, true)
-  return hits.length > 0 ? hits[0] : null
+  // Отсечение по этажам — операция ЧИСТО ВИЗУАЛЬНАЯ: плоскости живут в
+  // рендерере, а луч по-прежнему попадает в срезанную геометрию. Поэтому
+  // берём первое попадание В ВИДИМОМ диапазоне, а не hits[0]: иначе клик
+  // между этажами ставил точку на крыше, которой на экране нет.
+  //
+  // Правка стоит здесь одна на всех: через castAgainst идут постановка точки
+  // разметки, выбор зоны и детали, снятие отметки этажа, якорь зума, захват
+  // маркера вершины и приём перетаскиваемой бригады.
+  return pickWithinClip(hits, props.clipMin, props.clipMax)
+}
+
+/**
+ * Луч по модели с признаком «попадания были, но все срезаны».
+ *
+ * Различать эти случаи обязательно: клик по фону и клик по срезанной части
+ * здания одинаково дают null, но означают разное. В первом случае ставить
+ * точку неоткуда, во втором — под курсором есть плоскость разреза.
+ */
+function castModelWithClip(): { hit: THREE.Intersection | null; blockedByClip: boolean } {
+  const activeCamera = camera.value
+  const objects = modelList()
+  if (!activeCamera || objects.length === 0) return { hit: null, blockedByClip: false }
+  raycaster.setFromCamera(pointer, activeCamera as THREE.Camera)
+  const hits = raycaster.intersectObjects(objects, true)
+  const picked = pickWithinClip(hits, props.clipMin, props.clipMax)
+  return { hit: picked, blockedByClip: picked === null && hits.length > 0 }
+}
+
+/**
+ * Отметка плоскости среза — на неё падают клики по пустоте разреза.
+ *
+ * Только для режимов «выше» и «между», где срез идёт СНИЗУ и его плоскость
+ * совпадает с полом видимого этажа — тем самым, по которому ведут контур.
+ * В режиме «ниже» срез идёт сверху: его плоскость — это потолок над
+ * размечаемой поверхностью, и точка на ней оказалась бы выше остальных,
+ * перекосив зону. Там запасного варианта нет — как и до появления сечения.
+ */
+function cutPlaneY(): number | null {
+  if (props.clipMin !== null && props.clipMin !== undefined) return props.clipMin
+  return null
+}
+
+/**
+ * Точка на плоскости среза под курсором.
+ *
+ * Между этажами часть площади — это пустота на месте срезанного перекрытия.
+ * Без запасного варианта клик по ней просто терялся бы, и обвести зону по
+ * видимому этажу целиком не получалось: контур рвался на проёмах.
+ *
+ * Точка обязана лежать НАД планом модели. Плоскость среза бесконечна, и без
+ * этой проверки промах мимо здания — клик по небу у горизонта — ставил бы
+ * опорную точку в сотнях метров от объекта. Раньше такой клик просто не
+ * давал точки, и это поведение сохраняется.
+ */
+function pointOnCutPlane(): Vec3 | null {
+  const activeCamera = camera.value as THREE.Camera | undefined
+  const planeY = cutPlaneY()
+  if (!activeCamera || planeY === null) return null
+  raycaster.setFromCamera(pointer, activeCamera)
+  const { origin, direction } = raycaster.ray
+  const hit = rayPlaneIntersection(
+    [origin.x, origin.y, origin.z],
+    [direction.x, direction.y, direction.z],
+    [0, planeY, 0],
+    [0, 1, 0],
+  )
+  if (!hit) return null
+
+  const roots = modelList()
+  if (roots.length === 0) return null
+  const box = new THREE.Box3()
+  for (const root of roots) box.expandByObject(root)
+  if (box.isEmpty()) return null
+  // Небольшой запас: у края перекрытия целятся именно в кромку.
+  const margin = 1
+  if (
+    hit[0] < box.min.x - margin ||
+    hit[0] > box.max.x + margin ||
+    hit[2] < box.min.z - margin ||
+    hit[2] > box.max.z + margin
+  ) {
+    return null
+  }
+  return hit
 }
 
 function sectorMeshList(): THREE.Mesh[] {
@@ -373,12 +463,46 @@ function onPointerUp(event: PointerEvent): void {
   if (moved > 5 || performance.now() - downAt > 600) return
   if (!updatePointer(event)) return
 
-  // Режим разметки: ставим опорную точку в месте попадания луча по модели.
+  // Режимы разбираются в фиксированном порядке. Стор уже гарантирует, что
+  // активен максимум один, — порядок здесь защита от рассинхронизации, а не
+  // логика.
+
+  // Разметка: ставим опорную точку в месте попадания луча по модели.
   if (props.drawing) {
-    const hit = castAgainst(modelList())
+    const { hit, blockedByClip } = castModelWithClip()
     if (hit) {
       emit('point', [hit.point.x, hit.point.y, hit.point.z])
+      return
     }
+    // Модели в видимом диапазоне нет, но луч упёрся в срезанную часть —
+    // значит под курсором пустота на месте срезанного перекрытия. Кладём
+    // точку на сам срез, иначе контур между этажами рвался бы на проёмах.
+    // Промах мимо здания (blockedByClip === false) точки не даёт.
+    if (!blockedByClip) return
+    const onCut = pointOnCutPlane()
+    if (onCut) emit('point', [onCut[0], onCut[1], onCut[2]])
+    return
+  }
+
+  // Выделение по деталям: клик набирает детали, повторный по той же — снимает.
+  // На шаге объёма набор уже закрыт, но клик всё равно перехватываем: иначе
+  // он ушёл бы в обычный выбор и открыл карточку чужой зоны поверх режима.
+  if (props.detailStage && props.detailStage !== 'idle') {
+    if (props.detailStage !== 'pick') return
+    const hit = castAgainst(modelList())
+    if (hit) emit('pick-detail', hit.object.name || hit.object.uuid)
+    return
+  }
+
+  // Выделение этажей: клик по детали снимает её отметку и больше ничего.
+  if (props.levelPick) {
+    const hit = castAgainst(modelList())
+    if (!hit) return
+    // Отметка снимается с НИЗА детали: колонна стоит на перекрытии, и её
+    // основание — это и есть уровень, на котором она смонтирована. Центр или
+    // точка попадания давали бы отметку «где-то по середине».
+    const box = new THREE.Box3().setFromObject(hit.object)
+    if (!box.isEmpty()) emit('pick-elevation', box.min.y)
     return
   }
 
@@ -401,12 +525,10 @@ function onPointerUp(event: PointerEvent): void {
   }
 
   if (modelHit) {
+    // Отметку этажа здесь НЕ снимаем: иначе любой выбор детали открывал бы
+    // форму закрепления уровня и рисовал плоскость в сцене. Для этого есть
+    // отдельный режим «Выделение этажей».
     emit('select-mesh', modelHit.object.name || modelHit.object.uuid)
-    // Отметка этажа снимается с НИЗА детали: колонна стоит на перекрытии,
-    // и её основание — это и есть уровень, на котором она смонтирована.
-    // Центр или точка попадания давали бы отметку «где-то по середине».
-    const box = new THREE.Box3().setFromObject(modelHit.object)
-    if (!box.isEmpty()) emit('pick-elevation', box.min.y)
     return
   }
 
@@ -604,13 +726,25 @@ function release(): void {
   controls?.dispose()
   controls = null
   detach()
-  // Плоскости отсечения живут на рендерере: не снять их — и следующий
-  // проект откроется наполовину срезанным.
+  clearClipping()
+}
+
+/**
+ * Снять плоскости отсечения с общего рендерера.
+ *
+ * Не снять их совсем нельзя — следующий проект открылся бы наполовину
+ * срезанным. Но и снимать безусловно при размонтировании нельзя: TresJS
+ * пересоздаёт содержимое канваса (например, при догрузке слоя .glb), и новый
+ * экземпляр монтируется ДО того, как уйдёт старый. Уходящий стирал бы
+ * плоскости, которые пришедший уже выставил, — модель показывалась бы целой
+ * при включённом фильтре этажей. Хуже того, луч продолжал бы считать её
+ * срезанной: картинка и клики разошлись бы.
+ */
+function clearClipping(): void {
   const activeRenderer = renderer.value as THREE.WebGLRenderer | undefined
-  if (activeRenderer) {
-    activeRenderer.clippingPlanes = []
-    activeRenderer.localClippingEnabled = false
-  }
+  if (!activeRenderer) return
+  activeRenderer.clippingPlanes = []
+  activeRenderer.localClippingEnabled = false
 }
 
 onMounted(() => {
@@ -622,8 +756,15 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  release()
+  stopFrames?.()
+  stopFrames = null
+  controls?.dispose()
+  controls = null
+  detach()
+  // Плоскости снимает только уходящий ПОСЛЕДНИМ — тот, кого не сменил живой
+  // сосед. Иначе пересоздание канваса гасило бы отсечение у пришедшего.
   if (releaseActive === release) {
+    clearClipping()
     releaseActive = null
     bindInvalidate(null)
     // Камеру и рендерер с шины снимает ViewerView (resetSceneBus) при уходе

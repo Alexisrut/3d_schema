@@ -1,12 +1,13 @@
 /**
- * Тесты «магического выделения» и плоских операций под него.
+ * Тесты «выделения по деталям» и плоских операций под него.
  * Запуск:  node tests/run.mjs
  */
 import assert from 'node:assert/strict'
 
 import {
-  buildSmartSector,
-  detailsInside,
+  buildSectorFromDetails,
+  MIN_DETAIL_HEIGHT,
+  toggleDetailName,
   type DetailBounds,
 } from '../src/lib/smartSelect'
 import {
@@ -116,7 +117,29 @@ test('оболочка не ломается на дублях и вырожде
   assert.ok(convexHull2D([[0, 0], [1, 0], [2, 0]]).length <= 3)
 })
 
-console.log('\nsmartSelect.ts — захват деталей целиком')
+console.log('\nsmartSelect.ts — набор деталей')
+
+test('клик добавляет деталь, повторный — убирает', () => {
+  let names = toggleDetailName([], 'Колонна-1')
+  assert.deepEqual(names, ['Колонна-1'])
+  names = toggleDetailName(names, 'Плита-2')
+  assert.deepEqual(names, ['Колонна-1', 'Плита-2'])
+  names = toggleDetailName(names, 'Колонна-1')
+  assert.deepEqual(names, ['Плита-2'])
+})
+
+test('порядок набора сохраняется — счётчик не должен прыгать', () => {
+  let names: string[] = []
+  for (const n of ['Я', 'А', 'М']) names = toggleDetailName(names, n)
+  assert.deepEqual(names, ['Я', 'А', 'М'])
+})
+
+test('снятие последней детали даёт пустой набор, а не null', () => {
+  const names = toggleDetailName(['Одна'], 'Одна')
+  assert.deepEqual(names, [])
+})
+
+console.log('\nsmartSelect.ts — зона по выбранным деталям')
 
 /** Уличная зона и парковка рядом, здание — выше. */
 const DETAILS: DetailBounds[] = [
@@ -126,83 +149,78 @@ const DETAILS: DetailBounds[] = [
   { name: 'Кровля', minX: 0, maxX: 40, minZ: 0, maxZ: 10, minY: 20, maxY: 21 },
 ]
 
-/** Контур, задевающий краешек уличной зоны и краешек парковки. */
-const CORNER_TOUCH = [
-  [18, 0.1, 4],
-  [24, 0.1, 4],
-  [24, 0.1, 6],
-  [18, 0.1, 6],
-]
+function byName(...names: string[]): DetailBounds[] {
+  return names.map((n) => DETAILS.find((d) => d.name === n) as DetailBounds)
+}
 
-test('деталь, задетая краем, захватывается целиком', () => {
-  const captured = detailsInside(CORNER_TOUCH, DETAILS)
-  const names = captured.map((d) => d.name).sort()
-  assert.deepEqual(names, ['Парковка', 'Уличная зона'])
-})
-
-test('далёкая деталь не захватывается', () => {
-  const names = detailsInside(CORNER_TOUCH, DETAILS).map((d) => d.name)
-  assert.ok(!names.includes('Газон'))
-})
-
-test('деталь на другой отметке не захватывается', () => {
-  // Кровля висит на 20 м — выделение по земле её брать не должно,
-  // иначе «зона первого этажа» протыкала бы здание насквозь.
-  const names = detailsInside(CORNER_TOUCH, DETAILS).map((d) => d.name)
-  assert.ok(!names.includes('Кровля'))
-})
-
-test('запас по вертикали настраивается', () => {
-  const names = detailsInside(CORNER_TOUCH, DETAILS, { verticalReach: 50 }).map((d) => d.name)
-  assert.ok(names.includes('Кровля'))
-})
-
-test('зона строится по габаритам захваченных деталей, а не по контуру', () => {
-  const result = buildSmartSector(CORNER_TOUCH, DETAILS)
+test('зона накрывает выбранные детали целиком', () => {
+  const result = buildSectorFromDetails(byName('Уличная зона', 'Парковка'))
   assert.ok(result)
   const xs = result!.coordinates.map((p) => p[0])
   const zs = result!.coordinates.map((p) => p[2])
-  // Контур был 18..24 по X, а зона обязана накрыть обе детали целиком: 0..40.
   assert.equal(Math.min(...xs), 0)
   assert.equal(Math.max(...xs), 40)
   assert.equal(Math.min(...zs), 0)
   assert.equal(Math.max(...zs), 10)
-  assert.deepEqual(result!.details.sort(), ['Парковка', 'Уличная зона'])
 })
 
-test('высота зоны берётся от низа до верха деталей', () => {
-  const result = buildSmartSector(CORNER_TOUCH, DETAILS)
+test('невыбранная деталь в зону не попадает', () => {
+  // Газон стоит на 60..80 по X — если бы он захватывался, оболочка
+  // растянулась бы до 80 и накрыла пустое место между объектами.
+  const result = buildSectorFromDetails(byName('Уличная зона', 'Парковка'))
   assert.ok(result)
-  // Уличная зона 0..0.4, парковка 0..0.3 → высота 0.4
+  assert.equal(Math.max(...result!.coordinates.map((p) => p[0])), 40)
+})
+
+test('детали на разных отметках выбираются вместе — вертикального допуска больше нет', () => {
+  // В прежней редакции кровля на 20 м не захватывалась выделением по земле.
+  // Теперь выбор явный: раз пользователь ткнул — значит, так и хотел.
+  const result = buildSectorFromDetails(byName('Уличная зона', 'Кровля'))
+  assert.ok(result)
+  assert.equal(result!.baseY, 0)
+  assert.ok(Math.abs(result!.height - 21) < 1e-6, String(result!.height))
+})
+
+test('предлагаемая высота — от низа до верха выбранных деталей', () => {
+  const result = buildSectorFromDetails(byName('Уличная зона', 'Парковка'))
+  assert.ok(result)
   assert.ok(Math.abs(result!.height - 0.4) < 1e-6, String(result!.height))
 })
 
-test('плоские детали получают минимальную высоту, а не нулевую', () => {
+test('плоская деталь получает минимальную высоту, а не нулевую', () => {
   const flat: DetailBounds[] = [
-    { name: 'Плита', minX: 0, maxX: 10, minZ: 0, maxZ: 10, minY: 0, maxY: 0 },
+    { name: 'Плита', minX: 0, maxX: 10, minZ: 0, maxZ: 10, minY: 2, maxY: 2 },
   ]
-  const result = buildSmartSector(
-    [[1, 0, 1], [5, 0, 1], [5, 0, 5]],
-    flat,
-    { minHeight: 0.5 },
-  )
+  const result = buildSectorFromDetails(flat)
   assert.ok(result)
-  assert.equal(result!.height, 0.5)
-})
-
-test('пустой захват возвращает null, а не пустую зону', () => {
-  assert.equal(buildSmartSector([[100, 0, 100], [110, 0, 100], [110, 0, 110]], DETAILS), null)
-  assert.equal(buildSmartSector([[0, 0, 0]], DETAILS), null)
-  assert.equal(buildSmartSector(CORNER_TOUCH, []), null)
+  assert.equal(result!.height, MIN_DETAIL_HEIGHT)
 })
 
 test('основание кладётся на низ деталей', () => {
   const raised: DetailBounds[] = [
     { name: 'Площадка', minX: 0, maxX: 10, minZ: 0, maxZ: 10, minY: 3, maxY: 4 },
   ]
-  const result = buildSmartSector([[1, 3.5, 1], [5, 3.5, 1], [5, 3.5, 5]], raised)
+  const result = buildSectorFromDetails(raised)
   assert.ok(result)
+  assert.equal(result!.baseY, 3)
   assert.ok(result!.coordinates.every((p) => Math.abs(p[1] - 3) < 1e-6), result!.coordinates)
+})
+
+test('одна деталь — уже готовая зона', () => {
+  const result = buildSectorFromDetails(byName('Парковка'))
+  assert.ok(result)
+  assert.equal(result!.coordinates.length, 4)
+})
+
+test('пустой набор возвращает null, а не пустую зону', () => {
+  assert.equal(buildSectorFromDetails([]), null)
+})
+
+test('вырожденная деталь нулевой площади зоны не образует', () => {
+  const degenerate: DetailBounds[] = [
+    { name: 'Точка', minX: 5, maxX: 5, minZ: 5, maxZ: 5, minY: 0, maxY: 3 },
+  ]
+  assert.equal(buildSectorFromDetails(degenerate), null)
 })
 
 console.log(`\nПройдено: ${passed}, провалено: ${failed}`)

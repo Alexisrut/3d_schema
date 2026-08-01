@@ -140,7 +140,12 @@ function onBrigadeDragEnd(): void {
 }
 
 function onSelect(event: MouseEvent, sectorId: number): void {
-  emit('select', { sectorId, mode: modeFromEvent(event) })
+  const mode = modeFromEvent(event)
+  // Поп-ап виден только у выбранной зоны, а обычный клик по уже выбранной
+  // строке снимает выбор — то есть клик по самому поп-апу убирал бы его
+  // из-под курсора. Модификаторы при этом работают: ими набирают выделение.
+  if (mode === 'replace' && props.selectedIds.includes(sectorId)) return
+  emit('select', { sectorId, mode })
 }
 </script>
 

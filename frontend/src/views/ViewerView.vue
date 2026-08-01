@@ -25,7 +25,7 @@ import SectorSidebar from '@/components/SectorSidebar.vue'
 import ViewerToolbar from '@/components/ViewerToolbar.vue'
 import SceneCanvas from '@/components/scene/SceneCanvas.vue'
 import type { SelectMode, Visibility } from '@/lib/selection'
-import { buildSmartSector, type DetailBounds } from '@/lib/smartSelect'
+import { buildSectorFromDetails, type DetailBounds } from '@/lib/smartSelect'
 import { useViewport } from '@/lib/viewport'
 import { useAuthStore } from '@/stores/auth'
 import { useProjectStore } from '@/stores/project'
@@ -42,8 +42,8 @@ const { isMobile } = useViewport()
 const scene = ref<InstanceType<typeof SceneCanvas> | null>(null)
 const modelError = ref<string | null>(null)
 const namePromptOpen = ref(false)
-/** Окно имени для зоны, собранной умным выделением. */
-const smartPromptOpen = ref(false)
+/** Окно имени для зоны, собранной выделением по деталям. */
+const detailPromptOpen = ref(false)
 const newSectorName = ref('')
 const toast = ref<string | null>(null)
 const layersOpen = ref(true)
@@ -106,11 +106,17 @@ function closeSheets(): void {
   store.closeSidebar()
 }
 
-/** Разметка идёт на весь экран: шторки в этот момент только мешают. */
+/**
+ * Работа по модели идёт на весь экран: шторки в этот момент только мешают.
+ *
+ * Касается всех режимов, где нужен клик по сцене, — иначе шторка, из которой
+ * режим включили, осталась бы поверх модели и закрыла бы то, по чему надо
+ * кликать.
+ */
 watch(
-  () => store.draftStage,
-  (stage) => {
-    if (stage !== 'idle') activeSheet.value = null
+  () => [store.draftStage, store.detailStage, store.levelPickMode],
+  ([draftStage, detailStage, levelPick]) => {
+    if (draftStage !== 'idle' || detailStage !== 'idle' || levelPick) activeSheet.value = null
   },
 )
 
@@ -210,11 +216,14 @@ function onKeydown(event: KeyboardEvent): void {
     return
   }
   if (event.key === 'Escape') {
-    // Esc снимает по одному уровню: окно → шторка → разметка → выделение.
+    // Esc снимает ровно один уровень: окна → шторки → режимы → выделение.
     if (pending.value) pending.value = null
     else if (namePromptOpen.value) namePromptOpen.value = false
+    else if (detailPromptOpen.value) detailPromptOpen.value = false
     else if (activeSheet.value !== null) activeSheet.value = null
     else if (store.drawing) store.resetDrawing()
+    else if (store.detailMode) store.stopDetailSelection()
+    else if (store.levelPickMode) store.setLevelPickMode(false)
     else store.clearSelection()
   }
 }
@@ -230,25 +239,26 @@ function toggleDrawing(): void {
   else store.startDrawing()
 }
 
-// ------------------------------------------------- умное выделение (п. 3.2)
+// --------------------------------------------- выделение по деталям (п. 3.2)
 /**
- * Габариты всех деталей загруженных слоёв.
+ * Габариты выбранных деталей.
  *
  * Считаются на месте, по запросу: держать их в сторе значило бы тянуть туда
  * three.js, а обновлять при каждом кадре — гонять bounding box на десятки
- * тысяч мешей впустую.
+ * тысяч мешей впустую. Ищем только то, что выбрано, — обходить всю модель
+ * ради нескольких деталей незачем.
  */
-function collectDetails(): DetailBounds[] {
-  const details: DetailBounds[] = []
+function detailBounds(names: string[]): DetailBounds[] {
   const box = new ThreeBox3()
-  for (const root of modelRoots.value) {
-    root.traverse((child) => {
-      const mesh = child as unknown as { isMesh?: boolean; name?: string }
-      if (!mesh.isMesh) return
-      box.setFromObject(child)
-      if (box.isEmpty()) return
-      details.push({
-        name: child.name || 'Элемент',
+  const found: DetailBounds[] = []
+  for (const name of names) {
+    for (const root of modelRoots.value) {
+      const object = root.getObjectByName(name)
+      if (!object) continue
+      box.setFromObject(object)
+      if (box.isEmpty()) break
+      found.push({
+        name,
         minX: box.min.x,
         minY: box.min.y,
         minZ: box.min.z,
@@ -256,44 +266,59 @@ function collectDetails(): DetailBounds[] {
         maxY: box.max.y,
         maxZ: box.max.z,
       })
-    })
+      break
+    }
   }
-  return details
+  return found
 }
 
-/** Предпросмотр умного выделения — что захватится при закреплении. */
-const smartPreview = computed(() => {
-  if (!store.smartMode || store.draftPoints.length < 3) return null
-  return buildSmartSector(store.draftPoints, collectDetails())
+/** Что получится из набранных деталей: контур и предлагаемая высота. */
+const detailPreview = computed(() => {
+  if (store.detailNames.length === 0) return null
+  return buildSectorFromDetails(detailBounds(store.detailNames))
 })
 
-function toggleSmartSelection(): void {
-  if (store.smartMode) store.stopSmartSelection()
-  else {
-    store.startSmartSelection()
-    notify('Обведите область — детали, задетые контуром, войдут в зону целиком')
+function toggleDetailSelection(): void {
+  if (store.detailMode) {
+    store.stopDetailSelection()
+    return
   }
+  store.startDetailSelection()
+  notify('Кликайте по деталям модели — из них соберётся площадь зоны')
 }
 
-function openSmartPrompt(): void {
-  const preview = smartPreview.value
+/** Шаг 2: высота предлагается по габаритам выбранного, дальше её правят руками. */
+function startDetailExtrude(): void {
+  const preview = detailPreview.value
   if (!preview) {
-    notify('Контур пока не задел ни одной детали модели')
+    notify('Сначала выберите хотя бы одну деталь')
+    return
+  }
+  store.startDetailExtrude(preview.height)
+}
+
+function openDetailPrompt(): void {
+  if (!detailPreview.value) {
+    notify('Сначала выберите хотя бы одну деталь')
     return
   }
   newSectorName.value = `Зона ${store.sectors.length + 1}`
-  smartPromptOpen.value = true
+  detailPromptOpen.value = true
 }
 
-async function commitSmartSector(): Promise<void> {
-  const preview = smartPreview.value
+async function commitDetailSector(): Promise<void> {
+  const preview = detailPreview.value
   const name = newSectorName.value.trim()
   if (!preview || !name) return
+  const count = store.detailNames.length
   try {
-    const created = await store.commitSmartSector(name, preview.coordinates, preview.height)
-    smartPromptOpen.value = false
+    const created = await store.commitDetailSector(
+      name,
+      preview.coordinates,
+      store.detailHeight,
+    )
+    detailPromptOpen.value = false
     if (created) {
-      const count = preview.details.length
       notify(`Зона собрана из ${count} ${plural(count, 'детали', 'деталей', 'деталей')}`)
     }
   } catch (e) {
@@ -302,6 +327,14 @@ async function commitSmartSector(): Promise<void> {
 }
 
 // -------------------------------------------------------- этажи (п. 3.1)
+function toggleLevelPickMode(): void {
+  const wasOn = store.levelPickMode
+  store.toggleLevelPickMode()
+  if (!wasOn && store.levelPickMode) {
+    notify('Кликните по детали модели — с неё снимется отметка по высоте')
+  }
+}
+
 async function pinLevel(payload: { name: string; elevation: number }): Promise<void> {
   const level = await store.addLevel(payload.name, payload.elevation)
   if (level) notify(`Уровень «${level.name}» закреплён на отметке ${level.elevation.toFixed(2)} м`)
@@ -658,6 +691,16 @@ function cycleOpacity(): void {
   notify(`Прозрачность применена к ${OPACITY_SCOPE_LABEL[scope] ?? 'выбранному'}`)
 }
 
+/** Кнопка в панели «Слои» — только слои, независимо от выбранных зон. */
+function cycleLayerOpacity(): void {
+  const scope = store.cycleLayerOpacity()
+  if (scope === null) {
+    notify('В проекте нет ни одного слоя')
+    return
+  }
+  notify(`Прозрачность применена к ${OPACITY_SCOPE_LABEL[scope] ?? 'слоям'}`)
+}
+
 // -------------------------------------------------- подтверждение удаления
 function askDeleteSector(): void {
   const sector = store.activeSector
@@ -853,7 +896,7 @@ const layersPanelHandlers = {
     store.selectLayer(payload.id, payload.mode),
   'set-visibility': (payload: { id: number; value: Visibility }) =>
     store.setLayerVisibility(payload.id, payload.value),
-  'cycle-selected': cycleOpacity,
+  'cycle-selected': cycleLayerOpacity,
   'show-all': showAllLayers,
   upload: uploadModels,
   rename: renameModel,
@@ -877,6 +920,8 @@ const brigadePanelHandlers = {
   select: (payload: { id: number; mode: SelectMode }) =>
     store.selectBrigade(payload.id, payload.mode),
   delete: askDeleteBrigade,
+  'select-all': () => store.selectAllBrigades(),
+  clear: () => store.clearBrigadeSelection(),
   'delete-selected': askDeleteSelectedBrigades,
   unassign: (payload: { sectorId: number; brigadeId: number }) =>
     store.removeBrigade(payload.sectorId, payload.brigadeId),
@@ -894,12 +939,15 @@ const levelsPanelProps = computed(() => ({
   selectedIds: store.selectedLevelIds,
   draftElevation: store.draftElevation,
   filter: store.levelFilter,
+  pickMode: store.levelPickMode,
+  viewMode: store.viewMode,
   canEdit: auth.canEdit,
 }))
 
 const levelsPanelHandlers = {
   pin: pinLevel,
   toggle: (levelId: number) => store.toggleLevelSelection(levelId),
+  'toggle-pick-mode': toggleLevelPickMode,
   rename: (payload: { id: number; name: string }) =>
     store.renameLevel(payload.id, payload.name),
   delete: askDeleteLevel,
@@ -912,8 +960,10 @@ const sectorListHandlers = {
   'open-card': (sectorId: number) => store.openSectorCard(sectorId),
   'set-visibility': onSetSectorVisibility,
   'select-all': () => store.selectAllSectors(),
-  clear: () => store.clearSelection(),
+  clear: () => store.clearSectorSelection(),
   'delete-selected': askDeleteSelectedSectors,
+  'drop-brigade': (payload: { sectorId: number; brigadeId: number }) =>
+    store.addBrigade(payload.sectorId, payload.brigadeId),
 }
 
 const sidebarProps = computed(() => ({
@@ -975,6 +1025,16 @@ const moreActions = computed(() => {
       },
     })
     items.push({
+      key: 'details',
+      label: store.detailMode
+        ? `✓ Выделение по деталям (${store.detailCount})`
+        : '✨ Выделение по деталям',
+      run: () => {
+        toggleDetailSelection()
+        activeSheet.value = null
+      },
+    })
+    items.push({
       key: 'undo',
       label: '↶ Шаг назад',
       run: () => {
@@ -982,6 +1042,14 @@ const moreActions = computed(() => {
       },
     })
   }
+  // Уровни и их фильтр доступны и читателю: это способ рассмотреть модель,
+  // а не изменить данные. Открываем панель, а не сам режим: кнопка режима
+  // живёт внутри неё — там же, где и на десктопе.
+  items.push({
+    key: 'levels',
+    label: `Этажи${store.levels.length ? ` (${store.levels.length})` : ''}`,
+    run: () => openSheet('levels'),
+  })
   items.push({
     key: 'view',
     label: store.viewMode ? '✓ Режим просмотра' : 'Режим просмотра',
@@ -1037,11 +1105,11 @@ const moreActions = computed(() => {
       :can-commit="store.canCommit"
       :can-undo="store.canUndo"
       :edit-mode="store.editMode"
-      :smart-mode="store.smartMode"
+      :detail-stage="store.detailStage"
+      :detail-count="store.detailCount"
+      :detail-height="store.detailHeight"
       :view-mode="store.viewMode"
       :layers-open="layersOpen"
-      :opacity-scope="store.opacityScope"
-      :opacity-count="store.opacityTargetCount"
       :is-admin="auth.isAdmin"
       :can-edit="auth.canEdit"
       @toggle-drawing="toggleDrawing"
@@ -1050,10 +1118,12 @@ const moreActions = computed(() => {
       @commit="openNamePrompt"
       @undo="undo"
       @toggle-edit="store.toggleEditMode()"
-      @toggle-smart="toggleSmartSelection"
+      @toggle-details="toggleDetailSelection"
+      @detail-extrude="startDetailExtrude"
+      @detail-height="store.setDetailHeight($event)"
+      @detail-commit="openDetailPrompt"
       @toggle-view-mode="store.toggleViewMode()"
       @toggle-layers="layersOpen = !layersOpen"
-      @cycle-opacity="cycleOpacity"
       @reset-view="scene?.resetView()"
       @export="exportToExcel"
       @back="router.push({ name: 'projects' })"
@@ -1064,9 +1134,14 @@ const moreActions = computed(() => {
     <div class="viewer__body">
       <LayersPanel v-if="!isMobile && layersOpen" v-bind="layersPanelProps" v-on="layersPanelHandlers" />
 
+      <!--
+        Порядок задан пользователем: зоны — главный объект работы, бригады
+        назначаются на них, этажи же нужны эпизодически, при разборе по
+        отметкам.
+      -->
       <div v-if="!isMobile" class="viewer__left">
-        <BrigadePanel v-bind="brigadePanelProps" v-on="brigadePanelHandlers" />
         <SectorListPanel v-bind="sectorListProps" v-on="sectorListHandlers" />
+        <BrigadePanel v-bind="brigadePanelProps" v-on="brigadePanelHandlers" />
         <LevelsPanel v-bind="levelsPanelProps" v-on="levelsPanelHandlers" />
       </div>
 
@@ -1088,6 +1163,9 @@ const moreActions = computed(() => {
           :draft-height="store.draftHeight"
           :edit-mode="store.editMode"
           :edit-sector="editSector"
+          :detail-stage="store.detailStage"
+          :detail-names="store.detailNames"
+          :level-pick="store.levelPickMode"
           :levels="store.levels"
           :selected-level-ids="store.selectedLevelIds"
           :draft-elevation="store.draftElevation"
@@ -1096,6 +1174,7 @@ const moreActions = computed(() => {
           @point="store.addPoint($event)"
           @select-sector="onSelectSector"
           @select-mesh="store.selectMesh($event)"
+          @pick-detail="store.toggleDetail($event)"
           @pick-elevation="store.setDraftElevation($event)"
           @clear-selection="store.clearSelection()"
           @drop-brigade="store.addBrigade($event.sectorId, $event.brigadeId)"
@@ -1176,23 +1255,52 @@ const moreActions = computed(() => {
           Ctrl+Z — вернуться к правке контура.
         </div>
 
-        <div v-if="store.smartMode" class="overlay overlay--hint overlay--smart">
-          <strong>Умное выделение.</strong>
-          {{
-            smartPreview
-              ? `Захвачено деталей: ${smartPreview.details.length}. Нажмите «Собрать зону».`
-              : 'Обведите область — детали, задетые контуром, войдут в зону целиком.'
-          }}
-          <button
-            class="btn btn--tiny btn--primary"
-            type="button"
-            :disabled="!smartPreview"
-            @click="openSmartPrompt"
-          >
-            Собрать зону
-          </button>
-          <button class="btn btn--tiny" type="button" @click="store.stopSmartSelection()">
+        <div v-if="store.detailMode" class="overlay overlay--hint overlay--details">
+          <template v-if="store.detailStage === 'extrude'">
+            <strong>Шаг 2 из 2.</strong>
+            {{
+              isMobile
+                ? 'Высота зоны — ползунком снизу.'
+                : 'Высота зоны — в панели сверху. Ctrl+Z — вернуться к выбору деталей.'
+            }}
+            <button
+              class="btn btn--tiny btn--primary"
+              type="button"
+              @click="openDetailPrompt"
+            >
+              Закрепить зону
+            </button>
+          </template>
+          <template v-else>
+            <strong>Выделение по деталям.</strong>
+            {{
+              store.detailCount > 0
+                ? `Выбрано деталей: ${store.detailCount}. Повторный клик снимает деталь.`
+                : 'Кликайте по деталям модели — из них соберётся площадь зоны.'
+            }}
+            <button
+              class="btn btn--tiny btn--primary"
+              type="button"
+              :disabled="!detailPreview"
+              @click="startDetailExtrude"
+            >
+              Задать объём →
+            </button>
+          </template>
+          <button class="btn btn--tiny" type="button" @click="store.stopDetailSelection()">
             Отмена
+          </button>
+        </div>
+
+        <div v-else-if="store.levelPickMode" class="overlay overlay--hint overlay--details">
+          <strong>Выделение этажей.</strong>
+          {{
+            store.draftElevation === null
+              ? 'Кликните по детали модели — с неё снимется отметка по высоте.'
+              : `Отметка ${store.draftElevation.toFixed(2)} м снята. Закрепите уровень в панели «Этажи».`
+          }}
+          <button class="btn btn--tiny" type="button" @click="store.setLevelPickMode(false)">
+            Готово
           </button>
         </div>
 
@@ -1235,6 +1343,9 @@ const moreActions = computed(() => {
         :can-extrude="store.canExtrude"
         :can-commit="store.canCommit"
         :can-undo="store.canUndo"
+        :detail-stage="store.detailStage"
+        :detail-count="store.detailCount"
+        :detail-height="store.detailHeight"
         :sector-count="store.sectors.length"
         :brigade-count="store.brigades.length"
         :layer-count="store.models.length"
@@ -1244,6 +1355,10 @@ const moreActions = computed(() => {
         @update-height="store.updateDraftHeight($event)"
         @commit="openNamePrompt"
         @cancel-drawing="store.resetDrawing()"
+        @detail-extrude="startDetailExtrude"
+        @detail-height="store.setDetailHeight($event)"
+        @detail-commit="openDetailPrompt"
+        @cancel-details="store.stopDetailSelection()"
         @undo="undo"
       />
 
@@ -1270,6 +1385,12 @@ const moreActions = computed(() => {
       <BottomSheet :open="activeSheet === 'layers'" title="Слои" @close="activeSheet = null">
         <div class="sheet-panel">
           <LayersPanel v-bind="layersPanelProps" v-on="layersPanelHandlers" />
+        </div>
+      </BottomSheet>
+
+      <BottomSheet :open="activeSheet === 'levels'" title="Этажи" @close="activeSheet = null">
+        <div class="sheet-panel">
+          <LevelsPanel v-bind="levelsPanelProps" v-on="levelsPanelHandlers" />
         </div>
       </BottomSheet>
 
@@ -1320,17 +1441,16 @@ const moreActions = computed(() => {
       </form>
     </div>
 
-    <!-- Имя зоны, собранной умным выделением -->
-    <div v-if="smartPromptOpen" class="modal" @click.self="smartPromptOpen = false">
-      <form class="modal__card" @submit.prevent="commitSmartSector">
+    <!-- Имя зоны, собранной выделением по деталям -->
+    <div v-if="detailPromptOpen" class="modal" @click.self="detailPromptOpen = false">
+      <form class="modal__card" @submit.prevent="commitDetailSector">
         <h3>Название зоны</h3>
         <input v-model="newSectorName" autofocus required />
         <p class="modal__note">
-          Захвачено деталей: {{ smartPreview?.details.length ?? 0 }}, высота
-          {{ (smartPreview?.height ?? 0).toFixed(2) }} м
+          Деталей: {{ store.detailCount }}, высота {{ store.detailHeight.toFixed(2) }} м
         </p>
         <div class="modal__actions">
-          <button class="btn" type="button" @click="smartPromptOpen = false">Отмена</button>
+          <button class="btn" type="button" @click="detailPromptOpen = false">Отмена</button>
           <button class="btn btn--primary" type="submit">Создать</button>
         </div>
       </form>
@@ -1370,15 +1490,28 @@ const moreActions = computed(() => {
   border-right: 1px solid #21262d;
 }
 
-/* Панель бригад внутри левой колонки больше не рисует свою рамку и скролл. */
+/*
+  Панель бригад внутри левой колонки больше не рисует свою рамку и скролл, но
+  отделяется от соседей чертой — как остальные секции колонки.
+*/
 .viewer__left :deep(.panel) {
   width: auto;
   overflow: visible;
   border-right: none;
+  padding-top: 12px;
+  border-top: 1px solid #21262d;
 }
 
 .viewer__left :deep(.sectors) {
   padding: 12px 14px 16px;
+}
+
+/*
+  Черту рисует только то, что идёт ПОСЛЕ первой панели: у верхней она висела
+  бы вплотную под тулбаром и читалась как обрезок чужой рамки.
+*/
+.viewer__left > :deep(*:first-child) {
+  border-top: none;
 }
 
 .viewer__stage {
@@ -1440,6 +1573,19 @@ const moreActions = computed(() => {
   border-color: rgba(255, 200, 87, 0.5);
   color: #ffd88a;
   line-height: 1.45;
+}
+
+/*
+  Подсказка с кнопками: текст и действия в одну строку с переносом. Без этого
+  кнопки «Задать объём» и «Отмена» вставали в поток текста и прыгали по
+  ширине вместе со счётчиком деталей.
+*/
+.overlay--details {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 460px;
 }
 
 .overlay--count {

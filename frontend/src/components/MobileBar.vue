@@ -12,7 +12,7 @@
  */
 import { MAX_EXTRUDE_HEIGHT, type DraftStage } from '@/lib/drafting'
 
-export type MobileTab = 'sectors' | 'brigades' | 'layers' | 'more'
+export type MobileTab = 'sectors' | 'brigades' | 'layers' | 'levels' | 'more'
 
 defineProps<{
   draftStage: DraftStage
@@ -21,6 +21,10 @@ defineProps<{
   canExtrude: boolean
   canCommit: boolean
   canUndo: boolean
+  /** Шаг режима «Выделение по деталям» и его состояние. */
+  detailStage: 'idle' | 'pick' | 'extrude'
+  detailCount: number
+  detailHeight: number
   sectorCount: number
   brigadeCount: number
   layerCount: number
@@ -34,11 +38,19 @@ const emit = defineEmits<{
   (e: 'update-height', height: number): void
   (e: 'commit'): void
   (e: 'cancel-drawing'): void
+  (e: 'detail-extrude'): void
+  (e: 'detail-height', height: number): void
+  (e: 'detail-commit'): void
+  (e: 'cancel-details'): void
   (e: 'undo'): void
 }>()
 
 function onHeightInput(event: Event): void {
   emit('update-height', Number((event.target as HTMLInputElement).value))
+}
+
+function onDetailHeightInput(event: Event): void {
+  emit('detail-height', Number((event.target as HTMLInputElement).value))
 }
 </script>
 
@@ -114,6 +126,77 @@ function onHeightInput(event: Event): void {
           type="button"
           :disabled="!canCommit"
           @click="emit('commit')"
+        >
+          Закрепить зону
+        </button>
+      </div>
+    </template>
+
+    <!--
+      Выделение по деталям: те же два шага, что и у разметки. Ветки идут
+      ПОСЛЕ обеих веток разметки — на телефоне режимы взаимоисключающие,
+      и порядок здесь фиксирует, кто главнее, если состояние разъедется.
+    -->
+    <template v-else-if="detailStage === 'pick'">
+      <p class="bar__hint">
+        <strong>Шаг 1 из 2.</strong> Касайтесь деталей модели. Повторное
+        касание снимает деталь. Выбрано: {{ detailCount }}.
+      </p>
+      <div class="bar__row">
+        <button class="btn bar__btn" type="button" @click="emit('cancel-details')">
+          Отмена
+        </button>
+        <button
+          class="btn bar__btn"
+          type="button"
+          :disabled="!canUndo"
+          title="Убрать последнюю деталь"
+          @click="emit('undo')"
+        >
+          ↶
+        </button>
+        <button
+          class="btn btn--primary bar__btn bar__btn--wide"
+          type="button"
+          :disabled="detailCount === 0"
+          @click="emit('detail-extrude')"
+        >
+          Объём →
+        </button>
+      </div>
+    </template>
+
+    <template v-else-if="detailStage === 'extrude'">
+      <div class="bar__height">
+        <span class="bar__hint bar__hint--inline"><strong>Шаг 2.</strong> Высота</span>
+        <input
+          class="bar__range"
+          type="range"
+          min="0"
+          :max="Math.min(60, MAX_EXTRUDE_HEIGHT)"
+          step="0.5"
+          :value="detailHeight"
+          @input="onDetailHeightInput"
+        />
+        <span class="bar__value">{{ detailHeight.toFixed(1) }} м</span>
+      </div>
+      <div class="bar__row">
+        <button class="btn bar__btn" type="button" @click="emit('cancel-details')">
+          Отмена
+        </button>
+        <button
+          class="btn bar__btn"
+          type="button"
+          :disabled="!canUndo"
+          title="Вернуться к выбору деталей"
+          @click="emit('undo')"
+        >
+          ↶
+        </button>
+        <button
+          class="btn btn--primary bar__btn bar__btn--wide"
+          type="button"
+          @click="emit('detail-commit')"
         >
           Закрепить зону
         </button>

@@ -25,6 +25,7 @@ import {
   canBeginExtrude,
   canCommitDraft,
   cancelDraft,
+  clampHeight,
   draftHasUndo,
   isDrafting,
   setDraftHeight,
@@ -32,6 +33,7 @@ import {
   undoDraft,
   type DraftState,
 } from '@/lib/drafting'
+import { toggleDetailName } from '@/lib/smartSelect'
 import {
   EMPTY_SELECTION,
   applySelection,
@@ -138,15 +140,40 @@ export const useProjectStore = defineStore('project', () => {
   const sectorVisibility = ref<Record<number, Visibility>>({})
 
   // ----------------------------------------------------------------- режимы
+  /**
+   * Режимов взаимодействия ровно четыре, и они взаимоисключающие: все
+   * претендуют на один и тот же клик по модели. Гасит их всех единственный
+   * помощник `exitModesExcept` — иначе каждый новый режим приходится
+   * дописывать в четыре чужие функции, и на пятом это забывают.
+   *
+   * `viewMode` — не режим, а главный выключатель: он гасит остальные и
+   * запрещает их включение.
+   */
+  type InteractionMode = 'draw' | 'edit' | 'details' | 'levels'
+
   /** Режим просмотра: выключает разметку и выбор мешей модели. */
   const viewMode = ref(false)
   /** Режим редактирования границ: у выбранной зоны появляются маркеры вершин. */
   const editMode = ref(false)
   /**
-   * Умное выделение: контур не становится зоной сам, а указывает, какие
-   * детали модели захватить целиком (п. 3.2 доработок).
+   * Выделение по деталям (п. 3.2 доработок, вторая редакция): пользователь
+   * тыкает по деталям модели, из них собирается площадь, затем задаётся объём.
    */
-  const smartMode = ref(false)
+  const detailMode = ref(false)
+  /** Шаг режима: 'pick' — набор деталей, 'extrude' — задание высоты. */
+  const detailStage = ref<'idle' | 'pick' | 'extrude'>('idle')
+  /** Имена выбранных деталей — по ним идёт подсветка и сбор габаритов. */
+  const detailNames = ref<string[]>([])
+  /** Высота будущей зоны на шаге объёма. */
+  const detailHeight = ref(0)
+  /**
+   * Режим «Выделение этажей».
+   *
+   * Пока он выключен, клик по детали ничего не сообщает об уровнях: иначе
+   * любой выбор детали открывал бы форму закрепления и рисовал плоскость.
+   * Отметка снимается только здесь и только осознанно.
+   */
+  const levelPickMode = ref(false)
 
   // ------------------------------------------------------------------ этажи
   /**
@@ -212,7 +239,17 @@ export const useProjectStore = defineStore('project', () => {
     () => highlightedSectorIds.value.length > 0 || selectedMeshName.value !== null,
   )
 
-  const canUndo = computed(() => draftHasUndo(draft.value) || undoStack.value.length > 0)
+  /** Сколько деталей набрано — видно на кнопке режима и в подсказке. */
+  const detailCount = computed(() => detailNames.value.length)
+  /** Есть ли что отменять внутри режима деталей: сначала объём, потом детали. */
+  const detailHasUndo = computed(
+    () => detailStage.value === 'extrude' || detailNames.value.length > 0,
+  )
+  const canPickDetailVolume = computed(() => detailNames.value.length > 0)
+
+  const canUndo = computed(
+    () => draftHasUndo(draft.value) || detailHasUndo.value || undoStack.value.length > 0,
+  )
 
   /** Уровни, выбранные для фильтрации, по возрастанию отметки. */
   const selectedLevels = computed(() =>
@@ -282,7 +319,8 @@ export const useProjectStore = defineStore('project', () => {
     layerVisibility.value = {}
     sectorVisibility.value = {}
     editMode.value = false
-    smartMode.value = false
+    stopDetailSelection()
+    levelPickMode.value = false
     draftElevation.value = null
     selectedLevelIds.value = []
     levelFilter.value = null
@@ -421,6 +459,19 @@ export const useProjectStore = defineStore('project', () => {
    * обычный клик заменяет выделение, Ctrl/Cmd — добавляет, Shift — диапазон.
    */
   function selectSector(id: number, mode: SelectMode = 'replace'): void {
+    // В правке границ выделение держит маркеры вершин. Обычный клик по самой
+    // зоне (в неё же и целятся, таща маркер мимо) снимал бы выбор, и маркеры
+    // исчезали бы прямо под курсором. Снять выбор здесь можно Esc или
+    // выходом из режима.
+    if (
+      mode === 'replace' &&
+      editMode.value &&
+      selectedSectorIds.value.length === 1 &&
+      selectedSectorIds.value[0] === id
+    ) {
+      return
+    }
+
     sectorSelection.value = applySelection(sectorSelection.value, id, mode, sectorOrder.value)
     selectedMeshName.value = null
 
@@ -472,6 +523,31 @@ export const useProjectStore = defineStore('project', () => {
     if (activeSectorId.value === null) activeSectorId.value = sectorOrder.value[0] ?? null
   }
 
+  function selectAllBrigades(): void {
+    brigadeSelection.value = {
+      ids: [...brigadeOrder.value],
+      anchor: brigadeOrder.value[0] ?? null,
+    }
+  }
+
+  /** Снять выбор бригад, не трогая выделение зон: списки независимы. */
+  function clearBrigadeSelection(): void {
+    brigadeSelection.value = { ...EMPTY_SELECTION }
+  }
+
+  /**
+   * Снять выбор зон, не трогая бригады и слои.
+   *
+   * Кнопка «Снять выбор» стоит НАД списком зон и обязана действовать только
+   * на него. Общий clearSelection() (по Esc и клику по пустоте сцены) гасит
+   * всё сразу — это другое действие.
+   */
+  function clearSectorSelection(): void {
+    sectorSelection.value = { ...EMPTY_SELECTION }
+    activeSectorId.value = null
+    sidebarOpen.value = false
+  }
+
   function selectMesh(name: string | null): void {
     if (viewMode.value) return
     selectedMeshName.value = name
@@ -505,12 +581,24 @@ export const useProjectStore = defineStore('project', () => {
     return 'all-layers'
   })
 
-  /** Сколько объектов затронет кнопка — показывается на самой кнопке. */
-  const opacityTargetCount = computed(() => {
-    if (opacityScope.value === 'layers') return selectedLayerIds.value.length
-    if (opacityScope.value === 'sectors') return selectedSectorIds.value.length
-    return models.value.length
-  })
+  /**
+   * Прозрачность СЛОЁВ: кнопка в панели «Слои».
+   *
+   * Область действия здесь не выбирается по приоритету, как у общей кнопки:
+   * панель называется «Слои», и подействовать на выбранную зону она не может
+   * — раньше это было видно по подписи общей кнопки в тулбаре, а после её
+   * удаления такой переход стал бы молчаливым.
+   */
+  function cycleLayerOpacity(): 'layers' | 'all-layers' | null {
+    const scope = selectedLayerIds.value.length > 0 ? 'layers' : 'all-layers'
+    const targets = scope === 'layers' ? selectedLayerIds.value : models.value.map((m) => m.id)
+    if (targets.length === 0) return null
+    const next = nextVisibilityForGroup(targets, layerVisibility.value)
+    const map = { ...layerVisibility.value }
+    for (const id of targets) map[id] = next
+    layerVisibility.value = map
+    return scope
+  }
 
   /** Кнопка «Прозрачность»: обычный вид → полупрозрачный → скрытый. */
   function cycleOpacity(): 'layers' | 'sectors' | 'all-layers' | null {
@@ -547,11 +635,26 @@ export const useProjectStore = defineStore('project', () => {
     sectorVisibility.value = {}
   }
 
+  // ----------------------------------------------------------------- режимы
+  /**
+   * Погасить все режимы, кроме указанного.
+   *
+   * Рекурсии нет: помощник зовут ДО поднятия своего флага, а
+   * stopDetailSelection и setLevelPickMode(false) — чистые сеттеры, которые
+   * сами никого не гасят.
+   */
+  function exitModesExcept(keep: InteractionMode | null): void {
+    if (keep !== 'draw' && draft.value.stage !== 'idle') draft.value = cancelDraft()
+    if (keep !== 'edit') editMode.value = false
+    if (keep !== 'details' && detailMode.value) stopDetailSelection()
+    if (keep !== 'levels' && levelPickMode.value) setLevelPickMode(false)
+  }
+
   // --------------------------------------------------------------- разметка
   function startDrawing(): void {
     if (viewMode.value) return
+    exitModesExcept('draw')
     draft.value = startDraft()
-    editMode.value = false
     clearSelection()
   }
 
@@ -590,48 +693,131 @@ export const useProjectStore = defineStore('project', () => {
 
   function toggleEditMode(): void {
     if (viewMode.value) return
-    editMode.value = !editMode.value
-    if (editMode.value) draft.value = cancelDraft()
+    const next = !editMode.value
+    if (next) exitModesExcept('edit')
+    editMode.value = next
   }
 
-  /** Начать умное выделение: тот же обвод контура, другой смысл. */
-  function startSmartSelection(): void {
+  // ------------------------------------------------- выделение по деталям
+  /** Начать набор деталей: контура здесь нет, зона собирается из выбранного. */
+  function startDetailSelection(): void {
     if (viewMode.value) return
-    smartMode.value = true
-    editMode.value = false
-    draft.value = startDraft()
+    exitModesExcept('details')
+    detailMode.value = true
+    detailStage.value = 'pick'
+    detailNames.value = []
+    detailHeight.value = 0
     clearSelection()
   }
 
-  function stopSmartSelection(): void {
-    smartMode.value = false
-    draft.value = cancelDraft()
+  /** Чистый сеттер: никого не гасит, иначе exitModesExcept уходил бы в рекурсию. */
+  function stopDetailSelection(): void {
+    detailMode.value = false
+    detailStage.value = 'idle'
+    detailNames.value = []
+    detailHeight.value = 0
+  }
+
+  function toggleDetailSelection(): void {
+    if (detailMode.value) stopDetailSelection()
+    else startDetailSelection()
+  }
+
+  /** Клик по детали: добавить или убрать. Работает только на шаге набора. */
+  function toggleDetail(name: string): void {
+    if (!detailMode.value || detailStage.value !== 'pick') return
+    detailNames.value = toggleDetailName(detailNames.value, name)
   }
 
   /**
-   * Закрепить зону, собранную умным выделением.
+   * Шаг 2: перейти от площади к объёму.
    *
-   * Контур и высота приходят уже посчитанными — стор их не пересчитывает:
-   * геометрия деталей живёт в сцене, и тянуть three.js в хранилище незачем.
+   * Высота приходит от габаритов деталей и потому почти никогда не круглая.
+   * Округляем до сантиметров: в поле ввода «40.627129969882844» выглядит как
+   * сбой, а точность ниже сантиметра для зоны работ смысла не имеет.
    */
-  async function commitSmartSector(
+  function startDetailExtrude(height: number): void {
+    if (!detailMode.value || detailNames.value.length === 0) return
+    detailStage.value = 'extrude'
+    detailHeight.value = Math.round(clampHeight(height) * 100) / 100
+  }
+
+  function setDetailHeight(height: number): void {
+    if (detailStage.value !== 'extrude') return
+    detailHeight.value = clampHeight(height)
+  }
+
+  /**
+   * Отменить ОДНО действие внутри режима деталей.
+   *
+   * Порядок обратен действиям пользователя: сначала откатывается переход к
+   * объёму, потом снимается последняя выбранная деталь.
+   */
+  function undoDetailStep(): 'extrude' | 'detail' | null {
+    if (detailStage.value === 'extrude') {
+      detailStage.value = 'pick'
+      detailHeight.value = 0
+      return 'extrude'
+    }
+    if (detailNames.value.length > 0) {
+      detailNames.value = detailNames.value.slice(0, -1)
+      return 'detail'
+    }
+    return null
+  }
+
+  /**
+   * Закрепить зону, собранную из деталей.
+   *
+   * Контур приходит уже посчитанным: габариты деталей живут в сцене, и тянуть
+   * three.js в хранилище незачем.
+   */
+  async function commitDetailSector(
     name: string,
     coordinates: number[][],
     height: number,
   ): Promise<SectorSummary | null> {
     if (!project.value || coordinates.length < 3) return null
-    const created = await api.createSector(project.value.id, { name, coordinates, height })
+    const created = await api.createSector(project.value.id, {
+      name,
+      coordinates,
+      height: clampHeight(height),
+    })
     upsertSector(created)
-    smartMode.value = false
-    draft.value = cancelDraft()
+    stopDetailSelection()
     undoStack.value = [...undoStack.value, { kind: 'sector-created', sectorId: created.id }]
     selectSector(created.id)
     return created
   }
 
   // ------------------------------------------------------------------ этажи
+  /**
+   * Включить/выключить режим выделения этажей.
+   *
+   * Выключение обнуляет черновую отметку: иначе после выхода на сцене висела
+   * бы плоскость, а в панели — форма закрепления уровня.
+   */
+  function setLevelPickMode(value: boolean): void {
+    if (!value) {
+      levelPickMode.value = false
+      draftElevation.value = null
+      return
+    }
+    if (viewMode.value) return
+    exitModesExcept('levels')
+    levelPickMode.value = true
+  }
+
+  function toggleLevelPickMode(): void {
+    if (viewMode.value) return
+    setLevelPickMode(!levelPickMode.value)
+  }
+
   /** Снять отметку с выбранной детали модели — предложение для нового этажа. */
   function setDraftElevation(value: number | null): void {
+    // Отметку принимаем только в своём режиме: сцена может прислать её
+    // догоняющим событием уже после выхода из режима.
+    if (value !== null && !levelPickMode.value) return
     draftElevation.value = value
   }
 
@@ -674,7 +860,10 @@ export const useProjectStore = defineStore('project', () => {
       await api.deleteLevel(project.value.id, levelId)
       levels.value = levels.value.filter((l) => l.id !== levelId)
       selectedLevelIds.value = selectedLevelIds.value.filter((id) => id !== levelId)
+      // Режим «между» без пары уровней ничего не отсекает, а кнопка осталась
+      // бы подсвеченной — тот же случай, что и при снятии выбора вручную.
       if (selectedLevelIds.value.length === 0) levelFilter.value = null
+      else if (levelFilter.value === 'between') levelFilter.value = 'above'
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Не удалось удалить уровень'
     }
@@ -714,8 +903,7 @@ export const useProjectStore = defineStore('project', () => {
   function toggleViewMode(): void {
     viewMode.value = !viewMode.value
     if (viewMode.value) {
-      draft.value = cancelDraft()
-      editMode.value = false
+      exitModesExcept(null)
       selectedMeshName.value = null
     }
   }
@@ -965,6 +1153,13 @@ export const useProjectStore = defineStore('project', () => {
       return draftResult.undone === 'extrude' ? 'выдавливание объёма' : 'последнюю точку'
     }
 
+    // Незакреплённый набор деталей откатывается так же по одному шагу и
+    // раньше стека: пока зона не создана, отменять на сервере нечего.
+    const detailUndone = undoDetailStep()
+    if (detailUndone !== null) {
+      return detailUndone === 'extrude' ? 'выдавливание объёма' : 'последнюю деталь'
+    }
+
     const entry = undoStack.value[undoStack.value.length - 1]
     if (!entry) return null
     undoStack.value = undoStack.value.slice(0, -1)
@@ -1050,11 +1245,23 @@ export const useProjectStore = defineStore('project', () => {
     sectorVisibility,
     visibleModels,
     opacityScope,
-    opacityTargetCount,
 
     viewMode,
     editMode,
-    smartMode,
+
+    detailMode,
+    detailStage,
+    detailNames,
+    detailHeight,
+    detailCount,
+    canPickDetailVolume,
+    startDetailSelection,
+    stopDetailSelection,
+    toggleDetailSelection,
+    toggleDetail,
+    startDetailExtrude,
+    setDetailHeight,
+    commitDetailSector,
 
     levels,
     draftElevation,
@@ -1063,6 +1270,9 @@ export const useProjectStore = defineStore('project', () => {
     levelFilter,
     clipRange,
     clippingActive,
+    levelPickMode,
+    setLevelPickMode,
+    toggleLevelPickMode,
     setDraftElevation,
     refreshLevels,
     addLevel,
@@ -1071,9 +1281,6 @@ export const useProjectStore = defineStore('project', () => {
     toggleLevelSelection,
     setLevelFilter,
     clearLevelFilter,
-    startSmartSelection,
-    stopSmartSelection,
-    commitSmartSector,
     saveTopGeometry,
 
     draft,
@@ -1100,10 +1307,14 @@ export const useProjectStore = defineStore('project', () => {
     selectBrigade,
     selectLayer,
     selectAllSectors,
+    selectAllBrigades,
+    clearBrigadeSelection,
+    clearSectorSelection,
     selectMesh,
     clearSelection,
 
     cycleOpacity,
+    cycleLayerOpacity,
     setLayerVisibility,
     setSectorVisibility,
     resetVisibility,

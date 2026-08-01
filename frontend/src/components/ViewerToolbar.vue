@@ -1,16 +1,19 @@
 <script setup lang="ts">
 /**
- * Верхняя панель 3D-вида: двухэтапная разметка, правка границ, прозрачность,
- * «Шаг назад», сброс камеры.
+ * Верхняя панель 3D-вида: двухэтапная разметка, правка границ, «Шаг назад»,
+ * сброс камеры.
  *
  * Роли «Читатель» кнопки изменения не показываются вовсе (`canEdit`) —
- * остаются только вид, слои и прозрачность.
+ * остаются только вид и слои.
+ *
+ * Прозрачности здесь нет намеренно: она живёт там, где виден её объект —
+ * кнопкой в панели «Слои» и значком-глазом в строках списков слоёв и зон.
+ * В общей панели она путала: подпись приходилось дописывать областью действия
+ * («слои (2)», «зоны (1)»), потому что иначе было непонятно, на что нажимаешь.
  */
-import { computed } from 'vue'
-
 import { MAX_EXTRUDE_HEIGHT, type DraftStage } from '@/lib/drafting'
 
-const props = defineProps<{
+defineProps<{
   projectName: string
   connected: boolean
   /** Текущий шаг разметки: idle → polygon → extrude. */
@@ -21,24 +24,16 @@ const props = defineProps<{
   canCommit: boolean
   canUndo: boolean
   editMode: boolean
-  /** Активен режим «магического выделения» (п. 3.2 доработок). */
-  smartMode: boolean
+  /** Шаг режима «Выделение по деталям»: 'pick' — набор, 'extrude' — объём. */
+  detailStage: 'idle' | 'pick' | 'extrude'
+  /** Сколько деталей набрано — видно прямо на кнопке. */
+  detailCount: number
+  detailHeight: number
   viewMode: boolean
   layersOpen: boolean
-  /** На что подействует кнопка прозрачности прямо сейчас. */
-  opacityScope: 'layers' | 'sectors' | 'all-layers'
-  /** Сколько объектов она затронет. */
-  opacityCount: number
   isAdmin: boolean
   canEdit: boolean
 }>()
-
-/** Подпись на кнопке прозрачности: пользователь видит, что именно изменится. */
-const opacityScopeLabel = computed(() => {
-  if (props.opacityScope === 'layers') return `слои (${props.opacityCount})`
-  if (props.opacityScope === 'sectors') return `зоны (${props.opacityCount})`
-  return `всю модель (${props.opacityCount})`
-})
 
 const emit = defineEmits<{
   (e: 'toggle-drawing'): void
@@ -47,10 +42,12 @@ const emit = defineEmits<{
   (e: 'commit'): void
   (e: 'undo'): void
   (e: 'toggle-edit'): void
-  (e: 'toggle-smart'): void
+  (e: 'toggle-details'): void
+  (e: 'detail-extrude'): void
+  (e: 'detail-height', height: number): void
+  (e: 'detail-commit'): void
   (e: 'toggle-view-mode'): void
   (e: 'toggle-layers'): void
-  (e: 'cycle-opacity'): void
   (e: 'reset-view'): void
   (e: 'export'): void
   (e: 'back'): void
@@ -60,6 +57,10 @@ const emit = defineEmits<{
 
 function onHeightInput(event: Event): void {
   emit('update-height', Number((event.target as HTMLInputElement).value))
+}
+
+function onDetailHeightInput(event: Event): void {
+  emit('detail-height', Number((event.target as HTMLInputElement).value))
 }
 </script>
 
@@ -142,16 +143,63 @@ function onHeightInput(event: Event): void {
       {{ draftStage !== 'idle' ? 'Выйти из разметки' : 'Разметить зону' }}
     </button>
 
+    <!-- ------------------------- выделение по деталям: шаг 1 — набор деталей -->
+    <template v-if="detailStage === 'pick'">
+      <span class="toolbar__hint">
+        Шаг 1 из 2: выберите детали — набрано {{ detailCount }}
+      </span>
+      <button
+        class="btn btn--primary"
+        type="button"
+        :disabled="detailCount === 0"
+        title="Перейти к заданию высоты зоны"
+        @click="emit('detail-extrude')"
+      >
+        Задать объём →
+      </button>
+    </template>
+
+    <!-- ------------------------- выделение по деталям: шаг 2 — объём -->
+    <template v-if="detailStage === 'extrude'">
+      <span class="toolbar__hint">Шаг 2 из 2: высота зоны по {{ detailCount }} дет.</span>
+      <input
+        class="toolbar__range"
+        type="range"
+        min="0"
+        :max="Math.min(60, MAX_EXTRUDE_HEIGHT)"
+        step="0.5"
+        :value="detailHeight"
+        @input="onDetailHeightInput"
+      />
+      <input
+        class="toolbar__number"
+        type="number"
+        min="0"
+        :max="MAX_EXTRUDE_HEIGHT"
+        step="0.5"
+        :value="detailHeight"
+        @input="onDetailHeightInput"
+      />
+      <span class="toolbar__unit">м</span>
+      <button class="btn btn--primary" type="button" @click="emit('detail-commit')">
+        Закрепить зону
+      </button>
+    </template>
+
     <button
       v-if="canEdit"
       class="btn"
-      :class="{ 'btn--active': smartMode }"
+      :class="{ 'btn--active': detailStage !== 'idle' }"
       type="button"
       :disabled="viewMode"
-      title="Умное выделение: обведите область — детали, задетые контуром, войдут в зону целиком"
-      @click="emit('toggle-smart')"
+      title="Выделение по деталям: кликайте по деталям модели — из них соберётся площадь зоны, затем задайте объём"
+      @click="emit('toggle-details')"
     >
-      {{ smartMode ? '✓ Умное выделение' : '✨ Умное выделение' }}
+      {{
+        detailStage !== 'idle'
+          ? `✓ Выделение по деталям (${detailCount})`
+          : '✨ Выделение по деталям'
+      }}
     </button>
 
     <button
@@ -185,20 +233,6 @@ function onHeightInput(event: Event): void {
       @click="emit('toggle-layers')"
     >
       Слои
-    </button>
-
-    <!--
-      Кнопка никогда не бывает недоступной: без выделения она действует на все
-      слои сцены. Иначе непонятно, при каких условиях она вообще работает.
-    -->
-    <button
-      class="btn"
-      type="button"
-      :title="`Обычный вид → полупрозрачный → скрытый. Сейчас подействует на: ${opacityScopeLabel}`"
-      @click="emit('cycle-opacity')"
-    >
-      Прозрачность
-      <span class="toolbar__scope">{{ opacityScopeLabel }}</span>
     </button>
 
     <button
@@ -290,12 +324,6 @@ function onHeightInput(event: Event): void {
 
 .toolbar__unit {
   font-size: 12px;
-  color: #8b949e;
-}
-
-.toolbar__scope {
-  margin-left: 4px;
-  font-size: 11px;
   color: #8b949e;
 }
 

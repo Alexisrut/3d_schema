@@ -31,6 +31,11 @@ const props = defineProps<{
   editMode: boolean
   /** Зона, вершины которой можно перетаскивать. */
   editSector: SectorSummary | null
+  /** Шаг режима «Выделение по деталям» и набранные в нём детали. */
+  detailStage: 'idle' | 'pick' | 'extrude'
+  detailNames: string[]
+  /** Режим «Выделение этажей»: только в нём клик снимает отметку. */
+  levelPick: boolean
   /** Закреплённые этажи и выбранные для фильтрации. */
   levels: Level[]
   selectedLevelIds: number[]
@@ -45,6 +50,7 @@ const emit = defineEmits<{
   (e: 'point', point: [number, number, number]): void
   (e: 'select-sector', payload: { sectorId: number; mode: SelectMode }): void
   (e: 'select-mesh', name: string): void
+  (e: 'pick-detail', name: string): void
   (e: 'pick-elevation', elevation: number): void
   (e: 'clear-selection'): void
   (e: 'drop-brigade', payload: { sectorId: number; brigadeId: number }): void
@@ -87,6 +93,9 @@ watch(
     props.draftHeight,
     props.editMode,
     props.editSector?.id,
+    props.detailStage,
+    props.detailNames.join('|'),
+    props.levelPick,
     props.levels.length,
     props.selectedLevelIds.join(','),
     props.draftElevation,
@@ -150,11 +159,14 @@ defineExpose({
       ref="bridge"
       :drawing="drawing"
       :edit-mode="editMode"
+      :detail-stage="detailStage"
+      :level-pick="levelPick"
       :clip-min="clipMin"
       :clip-max="clipMax"
       @point="emit('point', $event)"
       @select-sector="emit('select-sector', $event)"
       @select-mesh="emit('select-mesh', $event)"
+      @pick-detail="emit('pick-detail', $event)"
       @pick-elevation="emit('pick-elevation', $event)"
       @clear-selection="emit('clear-selection')"
       @drop-brigade="emit('drop-brigade', $event)"
@@ -169,6 +181,7 @@ defineExpose({
       :url="layer.url"
       :label="layer.name"
       :highlight-name="selectedMeshName"
+      :highlight-names="detailNames"
       :ghost="ghostFor(layer.id)"
       @loaded="emit('model-loaded')"
       @error="emit('model-error', $event)"

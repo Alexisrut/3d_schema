@@ -1,22 +1,24 @@
 /**
- * «Магическое выделение» (п. 3.2 доработок).
+ * «Выделение по деталям» (п. 3.2 доработок, вторая редакция).
  *
- * Обычная разметка обводит пустой объём: где провёл контур — там и зона.
- * Умное выделение работает иначе: контур лишь указывает, ЧТО захватить.
- * Каждая деталь модели, задетая контуром хотя бы краем, попадает в зону
- * ЦЕЛИКОМ, а итоговая граница строится по их общим габаритам.
+ * Прежняя редакция («умное выделение») просила обвести контур и сама решала,
+ * какие детали он задел. Решение приходилось угадывать: контур ложился на
+ * поверхность модели, а деталь могла уходить вверх или вниз от неё, и допуск
+ * по вертикали то захватывал лишнее, то терял нужное. Пользователь видел
+ * результат только после закрепления зоны.
  *
- * Пример из ТЗ: обвели угол парковки и кусок уличной зоны — в сектор уходят
- * парковка и уличная зона полностью, а не обрезки под контуром.
+ * Теперь выбор явный: пользователь тыкает по деталям, каждая подсвечивается
+ * сразу, повторный клик снимает. Площадь зоны строится по выбранным деталям,
+ * высота предлагается по их габаритам и правится на втором шаге.
  *
- * Модуль чистый: на вход идут уже посчитанные габариты деталей, поэтому
- * логику можно проверить тестами без three.js и без сцены.
+ * Модуль чистый: на вход идут уже посчитанные габариты, поэтому логику можно
+ * проверить тестами без three.js и без сцены.
  */
-import { convexHull2D, polygonIntersectsRect, type Rect2, type Vec2 } from '@/three/geometry'
+import { convexHull2D, type Rect2, type Vec2 } from '@/three/geometry'
 
 /** Габариты детали модели в мировых координатах. */
 export interface DetailBounds {
-  /** Имя меша — попадает в подпись зоны и в отладку. */
+  /** Имя меша — по нему деталь находится в сцене и подсвечивается. */
   name: string
   minX: number
   minY: number
@@ -26,30 +28,17 @@ export interface DetailBounds {
   maxZ: number
 }
 
-export interface SmartSelection {
+export interface DetailSelection {
   /** Контур основания зоны: [[x, y, z], ...] на отметке низа деталей. */
   coordinates: number[][]
-  /** Высота выдавливания — от низа самой низкой детали до верха самой высокой. */
+  /** Высота по габаритам выбранных деталей — предложение для второго шага. */
   height: number
-  /** Что захвачено — показывается пользователю перед закреплением. */
-  details: string[]
+  /** Отметка низа: по ней зона ложится на те же перекрытия, что и детали. */
+  baseY: number
 }
 
-/**
- * Насколько контур «дотягивается» до детали по вертикали.
- *
- * Клики пользователя ложатся на поверхность модели, а деталь может уходить
- * вверх или вниз от этой отметки. Полностью игнорировать высоту нельзя:
- * иначе выделение на первом этаже захватило бы и кровлю над ним.
- */
-export const DEFAULT_VERTICAL_REACH = 4
-
-export interface SmartSelectOptions {
-  /** Допуск по вертикали от плоскости контура, м. */
-  verticalReach?: number
-  /** Минимальная высота зоны, если детали оказались плоскими. */
-  minHeight?: number
-}
+/** Минимальная высота зоны, если выбраны только плоские детали (плита, стяжка). */
+export const MIN_DETAIL_HEIGHT = 0.1
 
 /** След детали в плоскости XZ. */
 export function detailFootprint(detail: DetailBounds): Rect2 {
@@ -57,51 +46,33 @@ export function detailFootprint(detail: DetailBounds): Rect2 {
 }
 
 /**
- * Детали, задетые контуром.
+ * Добавить или убрать деталь из набора.
  *
- * Условий два: след детали пересекается с контуром в плане И деталь
- * дотягивается по вертикали до уровня контура. Второе отсекает этажи выше
- * и ниже — без него «выделение по плану» захватывало бы всё здание насквозь.
+ * Порядок сохраняется в порядке выбора: он виден пользователю в счётчике и
+ * в подсказке, а сортировка по имени перемешивала бы список на каждом клике.
  */
-export function detailsInside(
-  polygon: number[][],
-  details: DetailBounds[],
-  options: SmartSelectOptions = {},
-): DetailBounds[] {
-  if (polygon.length < 3) return []
-  const reach = options.verticalReach ?? DEFAULT_VERTICAL_REACH
-
-  const flat: Vec2[] = polygon.map((point) => [point[0], point[2]])
-  const levels = polygon.map((point) => point[1] ?? 0)
-  const planeMin = Math.min(...levels) - reach
-  const planeMax = Math.max(...levels) + reach
-
-  return details.filter((detail) => {
-    if (detail.maxY < planeMin || detail.minY > planeMax) return false
-    return polygonIntersectsRect(flat, detailFootprint(detail))
-  })
+export function toggleDetailName(names: readonly string[], name: string): string[] {
+  return names.includes(name) ? names.filter((item) => item !== name) : [...names, name]
 }
 
 /**
- * Собрать зону из захваченных деталей.
+ * Собрать зону из выбранных деталей.
  *
  * Граница — выпуклая оболочка следов деталей: она плотнее общего
  * прямоугольника и не тянет зону на пустое место между разнесёнными
- * объектами. Основание кладётся на низ самой низкой детали, высота — до
- * верха самой высокой.
+ * объектами. Основание кладётся на низ самой низкой детали, предлагаемая
+ * высота — до верха самой высокой.
+ *
+ * Возвращает null, если оболочка вырождена: одна деталь нулевой площади или
+ * несколько деталей, стоящих строго по одной линии, зоны не образуют.
  */
-export function buildSmartSector(
-  polygon: number[][],
-  details: DetailBounds[],
-  options: SmartSelectOptions = {},
-): SmartSelection | null {
-  const captured = detailsInside(polygon, details, options)
-  if (captured.length === 0) return null
+export function buildSectorFromDetails(details: readonly DetailBounds[]): DetailSelection | null {
+  if (details.length === 0) return null
 
   const corners: Vec2[] = []
   let minY = Number.POSITIVE_INFINITY
   let maxY = Number.NEGATIVE_INFINITY
-  for (const detail of captured) {
+  for (const detail of details) {
     const rect = detailFootprint(detail)
     corners.push(
       [rect.minX, rect.minY],
@@ -112,17 +83,14 @@ export function buildSmartSector(
     minY = Math.min(minY, detail.minY)
     maxY = Math.max(maxY, detail.maxY)
   }
+  if (!Number.isFinite(minY) || !Number.isFinite(maxY)) return null
 
   const hull = convexHull2D(corners)
   if (hull.length < 3) return null
 
-  const minHeight = options.minHeight ?? 0.1
-  const height = Math.max(minHeight, maxY - minY)
-
   return {
-    // Основание чуть выше низа деталей — чтобы зона не тонула в плите.
     coordinates: hull.map(([x, z]) => [x, minY, z]),
-    height,
-    details: captured.map((detail) => detail.name),
+    height: Math.max(MIN_DETAIL_HEIGHT, maxY - minY),
+    baseY: minY,
   }
 }

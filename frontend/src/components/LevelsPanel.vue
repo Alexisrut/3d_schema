@@ -2,9 +2,13 @@
 /**
  * Панель «Этажи» (п. 3.1 доработок).
  *
- * Порядок работы: пользователь кликает по любой детали модели → система
- * снимает её отметку по оси Y → здесь эта отметка предлагается к
- * закреплению под своим названием.
+ * Порядок работы: включить режим «Выделение этажей» → кликнуть по любой
+ * детали модели → система снимет её отметку по оси Y → здесь эта отметка
+ * предлагается к закреплению под своим названием.
+ *
+ * Режим нужен именно как режим: без него отметка снималась при ЛЮБОМ выборе
+ * детали, и форма закрепления уровня выскакивала каждый раз, когда человек
+ * просто рассматривал модель.
  *
  * Дальше уровни служат сечением: показать только выше отметки, только ниже
  * или объём между двумя выбранными.
@@ -19,12 +23,17 @@ const props = defineProps<{
   /** Отметка с выбранной детали; null — деталь не выбрана. */
   draftElevation: number | null
   filter: 'above' | 'below' | 'between' | null
+  /** Включён ли режим снятия отметок с деталей. */
+  pickMode: boolean
+  /** «Просмотр» выключает все режимы изменения — кнопка гаснет вместе с ними. */
+  viewMode: boolean
   canEdit: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'pin', payload: { name: string; elevation: number }): void
   (e: 'toggle', levelId: number): void
+  (e: 'toggle-pick-mode'): void
   (e: 'rename', payload: { id: number; name: string }): void
   (e: 'delete', level: Level): void
   (e: 'set-filter', mode: 'above' | 'below' | 'between' | null): void
@@ -84,13 +93,33 @@ function format(elevation: number): string {
       <span class="levels__count">{{ levels.length }}</span>
     </header>
 
-    <p class="levels__hint">
+    <!-- ------------------------------------------------- режим снятия отметок -->
+    <button
+      v-if="canEdit"
+      class="btn btn--tiny levels__mode"
+      :class="{ 'btn--active': pickMode }"
+      type="button"
+      :disabled="viewMode"
+      :title="
+        viewMode
+          ? 'Недоступно в режиме просмотра'
+          : 'Пока режим включён, клик по детали модели снимает её отметку по высоте'
+      "
+      @click="emit('toggle-pick-mode')"
+    >
+      {{ pickMode ? '✓ Выделение этажей' : '⇱ Выделение этажей' }}
+    </button>
+
+    <p v-if="canEdit && pickMode" class="levels__hint levels__hint--active">
       Коснитесь любой детали модели — система снимет её отметку и предложит
       закрепить уровень.
     </p>
+    <p v-else-if="canEdit" class="levels__hint">
+      Включите «Выделение этажей», чтобы снять отметку с детали модели.
+    </p>
 
     <!-- ------------------------------------------- закрепление отметки -->
-    <form v-if="canEdit && hasDraft" class="pin" @submit.prevent="pin">
+    <form v-if="canEdit && pickMode && hasDraft" class="pin" @submit.prevent="pin">
       <div class="pin__row">
         <input v-model="draftName" class="pin__name" placeholder="Название" required />
         <!--
@@ -109,7 +138,7 @@ function format(elevation: number): string {
       <button class="btn btn--primary btn--tiny" type="submit">Закрепить уровень</button>
     </form>
 
-    <p v-else-if="canEdit" class="levels__idle">Деталь не выбрана.</p>
+    <p v-else-if="canEdit && pickMode" class="levels__idle">Деталь не выбрана.</p>
 
     <!-- ------------------------------------------------ список уровней -->
     <p v-if="!levels.length" class="levels__empty">Уровней пока нет.</p>
@@ -150,7 +179,7 @@ function format(elevation: number): string {
       <p class="filter__hint">
         {{
           selectedIds.length === 0
-            ? 'Выберите уровень, чтобы отсечь модель по нему.'
+            ? 'Выберите уровень, чтобы показать его плоскость и отсечь по нему модель.'
             : selectedIds.length === 1
               ? 'Выбран 1 уровень. Для режима «между» отметьте второй.'
               : 'Выбрано 2 уровня — доступен показ объёма между ними.'
@@ -233,6 +262,15 @@ function format(elevation: number): string {
   font-size: 11px;
   color: #7d8590;
   line-height: 1.4;
+}
+
+/* В активном режиме подсказка перестаёт быть фоном: по ней сверяют, что делать. */
+.levels__hint--active {
+  color: #ffd88a;
+}
+
+.levels__mode {
+  align-self: flex-start;
 }
 
 .pin {

@@ -27,6 +27,8 @@ const props = defineProps<{
   label: string
   /** Имя выделенного меша модели (этаж/элемент) либо null. */
   highlightName: string | null
+  /** Имена деталей, набранных в режиме «Выделение по деталям». */
+  highlightNames?: string[]
   /** Приглушить весь слой: выбран сектор либо слой помечен полупрозрачным. */
   ghost: boolean
 }>()
@@ -191,6 +193,17 @@ function applyAppearance(): void {
   const root = modelRoot
   if (!root || !proxy) return
 
+  // Набор деталей важнее одиночного выделения: пока идёт режим «Выделение по
+  // деталям», подсвечивать надо именно его, а не деталь, выбранную до входа.
+  const picked = (props.highlightNames ?? [])
+    .map((name) => findMeshByName(root, name))
+    .filter((mesh): mesh is THREE.Mesh => mesh !== null)
+  if (picked.length > 0) {
+    proxy.setGhost(true)
+    proxy.setHighlight(picked)
+    return
+  }
+
   if (props.ghost) {
     proxy.setGhost(true)
     proxy.setHighlight(null)
@@ -204,10 +217,15 @@ function applyAppearance(): void {
 }
 
 watch(() => props.url, load, { immediate: true })
-watch(() => [props.highlightName, props.ghost], () => {
-  applyAppearance()
-  invalidateScene()
-})
+watch(
+  // Набор деталей сравниваем по содержимому: массив пересоздаётся на каждом
+  // клике, и сравнение по ссылке срабатывало бы даже без изменений.
+  () => [props.highlightName, props.ghost, (props.highlightNames ?? []).join('|')],
+  () => {
+    applyAppearance()
+    invalidateScene()
+  },
+)
 
 onBeforeUnmount(disposeCurrent)
 </script>
