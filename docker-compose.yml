@@ -1,0 +1,52 @@
+# Развёртывание на сервере: два контейнера на одной внутренней сети.
+#
+#   web  — nginx: отдаёт собранный фронтенд, проксирует /api, /media, /ws;
+#   api  — FastAPI + uvicorn: единственный, кто трогает базу и файлы.
+#
+# Наружу открыт ТОЛЬКО web. Бэкенд порт не публикует: попасть в него можно
+# лишь через nginx, а значит, мимо ограничения на размер загрузки и мимо
+# логов доступа не пройти.
+#
+# Подробности и порядок действий — в DEPLOY.md.
+
+services:
+  api:
+    build:
+      context: ./backend
+    image: 3d-monitoring-api:latest
+    restart: unless-stopped
+    # Настройки (пароли SMTP, APP_SECRET_KEY) читаются из файла, а не пишутся
+    # здесь: docker-compose.yml лежит в репозитории, .env — нет.
+    env_file:
+      - ./backend/.env
+    environment:
+      # База и хранилище вынесены из образа в примонтированный каталог.
+      # Внутри образа они жили бы до первой пересборки — и исчезли вместе с ней.
+      # Четыре слеша в URL — признак абсолютного пути в SQLite.
+      APP_DATABASE_URL: sqlite:////data/data.db
+      APP_STORAGE_DIR: /data/storage
+    volumes:
+      - ./data:/data
+    healthcheck:
+      # Пока проверка не прошла, nginx не поднимается: иначе первые запросы
+      # уходили бы в ещё не готовый бэкенд и пользователь видел бы 502.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  web:
+    build:
+      context: ./frontend
+    image: 3d-monitoring-web:latest
+    restart: unless-stopped
+    ports:
+      # Слева — порт на сервере, справа — внутри контейнера. Для HTTPS
+      # добавьте "443:443" и раскомментируйте монтирование сертификатов.
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    # volumes:
+    #   - ./deploy/certs:/etc/nginx/certs:ro
